@@ -39,8 +39,8 @@ class TestAppRegression(unittest.TestCase):
     def test_03_bundles_cart_rescue(self):
         self.check_page("Bundles & Cart Rescue")
 
-    def test_04_promo_check(self):
-        self.check_page("Promo Check")
+    def test_04_banner_performance(self):
+        self.check_page("Banner Performance")
 
     def test_05_season_playbook(self):
         self.check_page("Season Playbook")

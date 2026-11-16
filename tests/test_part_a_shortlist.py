@@ -125,6 +125,7 @@ class TestShortlistBuilder(unittest.TestCase):
 
     def test_07_add_from_scorecard(self):
         app = self.new_app()
+        self.go_to(app, "Shelf Scorecard")  # app now opens on the Overview page
 
         add_buttons = [
             b for b in app.button

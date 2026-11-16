@@ -1,0 +1,21 @@
+# Holiday Shelf theme. Viewers can switch Light / Dark / System from the app's
+# top-right menu: three dots -> Settings -> Theme.
+[theme]
+base = "light"
+primaryColor = "#4F46E5"
+backgroundColor = "#F5F6FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B2133"
+font = "sans serif"
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#F5F6FA"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B2133"
+
+[theme.dark]
+primaryColor = "#818CF8"
+backgroundColor = "#0E1220"
+secondaryBackgroundColor = "#171C2E"
+textColor = "#E8EAF2"
