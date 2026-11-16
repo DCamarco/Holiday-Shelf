@@ -9,8 +9,173 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from pathlib import Path
+from io import BytesIO
+from xml.sax.saxutils import escape
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
+import math
+from statistics import NormalDist
 
 DATA_DIR = Path(__file__).parent / "data"
+
+def required_visits_per_variant(
+    baseline_rate,
+    relative_lift=0.20,
+    alpha=0.05,
+    power=0.80,
+):
+    """Estimate visits per variant for a two-sided A/B test."""
+    if pd.isna(baseline_rate):
+        return None
+
+    baseline = float(baseline_rate)
+
+    if not 0 < baseline < 1:
+        return None
+
+    if not 0 < relative_lift or relative_lift > 1:
+        return None
+
+    improved_rate = min(
+        baseline * (1 + relative_lift), 0.999999
+    )
+    average_rate = (baseline + improved_rate) / 2
+
+    z_alpha = NormalDist().inv_cdf(1 - alpha / 2)
+    z_power = NormalDist().inv_cdf(power)
+
+    numerator = (
+        z_alpha * math.sqrt(
+            2 * average_rate * (1 - average_rate)
+        )
+        + z_power * math.sqrt(
+            baseline * (1 - baseline)
+            + improved_rate * (1 - improved_rate)
+        )
+    ) ** 2
+
+    denominator = (improved_rate - baseline) ** 2
+
+    return math.ceil(numerator / denominator)
+
+
+
+def build_shelf_brief_pdf(shortlist_df, category_mix, price_mix, weak_count):
+    """Generate a one-page landscape merchandising brief."""
+    from reportlab.platypus import KeepInFrame
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=landscape(letter),
+        leftMargin=.35*inch, rightMargin=.35*inch,
+        topMargin=.3*inch, bottomMargin=.3*inch,
+        title="Holiday Shelf Merchandising Plan",
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("BriefTitle", parent=styles["Title"],
+                                 fontSize=15, leading=18, alignment=0, spaceAfter=3)
+    cell_style = ParagraphStyle("BriefCell", parent=styles["Normal"],
+                                fontSize=6.5, leading=7.7)
+    note_style = ParagraphStyle("BriefNote", parent=styles["Normal"],
+                                fontSize=7, leading=9)
+
+    def show(value, fallback="—"):
+        if value is None or pd.isna(value) or str(value).strip() == "":
+            return escape(fallback)
+        return escape(str(value))
+
+    rows = [[Paragraph(f'<font color="white"><b>{name}</b></font>', cell_style)
+             for name in ("Product", "Category", "Phase", "Placement", "Price",
+                          "Replace / Pair", "Conv.", "Visits/variant")]]
+    for _, item in shortlist_df.iterrows():
+        slot = item.get("placement_slot")
+        if slot == "Cart add-on":
+            replacement = "Add-on to " + str(item.get("paired_with") or "unknown anchor")
+        else:
+            replacement = item.get("replacement_product")
+            if replacement is None or pd.isna(replacement) or replacement == "":
+                replacement = item.get("replaces")
+            if replacement is None or pd.isna(replacement) or replacement == "":
+                replacement = "No replacement"
+        price = item.get("typical_price")
+        price_label = f"${float(price):,.2f}" if pd.notna(price) else "Unknown"
+        rate = item.get("view_to_buy_rate")
+        rate_label = f"{float(rate):.1%}" if pd.notna(rate) else "N/A"
+        visits = item.get("test_visits_per_variant")
+        visits_label = f"{int(float(visits)):,}" if pd.notna(visits) else "N/A"
+        values = [item.get("item_name"), item.get("item_category"),
+                  item.get("holiday_phase", "Unassigned"), slot or "Unassigned",
+                  price_label, replacement, rate_label, visits_label]
+        rows.append([Paragraph(show(value), cell_style) for value in values])
+
+    table = Table(rows, colWidths=[128, 89, 73, 73, 51, 130, 62, 110], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263746")),
+        ("GRID", (0, 0), (-1, -1), .3, colors.HexColor("#BCC4CC")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F1F4F6")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+
+    def summarize(frame, label_col):
+        return "; ".join(
+            f"{show(row[label_col])}: {int(row['Products'])} "
+            f"({float(row['Share (%)']):.1f}%)"
+            for _, row in frame.iterrows()
+        ) or "No data"
+
+    mix = Table([[
+        Paragraph("<b>Category mix</b><br/>" + summarize(category_mix, "Category"), note_style),
+        Paragraph("<b>Price mix</b><br/>" + summarize(price_mix, "Price band"), note_style),
+    ]], colWidths=[358, 358])
+    mix.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), .4, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), .4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    priced = int(shortlist_df["typical_price"].notna().sum())
+    story = [
+        Paragraph("Holiday Shelf — Merchandising Plan", title_style),
+        Paragraph(f"<b>{len(shortlist_df)}</b> selected products &nbsp;|&nbsp; "
+                  f"<b>{priced}</b> with observed price data &nbsp;|&nbsp; "
+                  f"<b>{weak_count}</b> with weak data", note_style),
+        Spacer(1, 7),
+        Paragraph("<b>Selected shelf products</b>", note_style),
+        Spacer(1, 4),
+        table,
+        Spacer(1, 10),
+        mix,
+        Spacer(1, 7),
+        Paragraph(f"<b>Data quality:</b> {weak_count} of {len(shortlist_df)} selected products have "
+                  "weak/incomplete performance data. Unknown prices are not estimated.", note_style),
+        Spacer(1, 4),
+        Paragraph("<b>Test assumptions:</b> Two-sided A/B test, 95% confidence, "
+                  "80% power, 20% relative conversion lift; visits shown per variant. "
+                  "Based on the 2020–2021 holiday season; estimates, not guarantees.", note_style),
+    ]
+    doc.build([KeepInFrame(720, 536, story, mode="shrink")])
+    pdf_data = buffer.getvalue()
+    buffer.close()
+    return pdf_data
+
 
 st.set_page_config(page_title="Holiday Shelf", layout="wide")
 
@@ -18,6 +183,32 @@ st.set_page_config(page_title="Holiday Shelf", layout="wide")
 @st.cache_data
 def load_product_summary():
     return pd.read_csv(DATA_DIR / "product_summary.csv")
+
+@st.cache_data
+def load_product_prices():
+    """Load typical and observed price ranges for each product."""
+    orders = pd.read_csv(
+        DATA_DIR / "orders_v2.csv",
+        usecols=["item_name", "price"]
+    )
+
+    orders["price"] = pd.to_numeric(
+        orders["price"], errors="coerce"
+    )
+
+    orders = orders.dropna(subset=["item_name", "price"])
+
+    prices = (
+        orders.groupby("item_name", as_index=False)
+        .agg(
+            typical_price=("price", "median"),
+            min_price=("price", "min"),
+            max_price=("price", "max"),
+            price_observations=("price", "count")
+        )
+    )
+
+    return prices
 
 
 @st.cache_data
@@ -193,7 +384,7 @@ if page == "Shelf Scorecard":
             },
         )
         fig.update_layout(height=600, legend_title_text="Quadrant")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         n_flagged_shown = int(plot_df["views_likely_insufficient"].sum())
         st.caption(
@@ -226,7 +417,7 @@ if page == "Shelf Scorecard":
                     "revenue", "label", "views_likely_insufficient",
                 ]
             ].sort_values("revenue", ascending=False),
-            use_container_width=True,
+            width="stretch",
         )
 
 # ---------------------------------------------------------------------------
@@ -340,7 +531,7 @@ elif page == "Opportunity Finder":
                     size_max=42,
                 )
                 fig.update_layout(height=480)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st.markdown("### Recommended opportunity shortlist")
                 for _, row in view.iterrows():
@@ -428,7 +619,7 @@ elif page == "Bundles & Cart Rescue":
                          hover_data=["addon_attach_rate", "lift", "anchor_price", "addon_price"])
             fig.update_layout(height=max(350, 24 * len(show)), yaxis_title=None,
                               xaxis_title="Orders containing both", margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             table = view[["anchor", "addon", "anchor_price", "addon_price", "orders_together",
                           "addon_attach_rate", "lift"]].copy()
@@ -436,7 +627,7 @@ elif page == "Bundles & Cart Rescue":
             table["lift"] = table["lift"].round(1)
             table.columns = ["Anchor", "Add-on", "Anchor $", "Add-on $", "Orders together",
                              "Add-on in % of anchor orders", "Lift"]
-            st.dataframe(table, use_container_width=True, hide_index=True)
+            st.dataframe(table, width="stretch", hide_index=True)
 
             st.markdown("**Add an add-on to the shortlist**")
             options = [f"{r.anchor}  +  {r.addon}" for r in view.head(50).itertuples()]
@@ -468,14 +659,14 @@ elif page == "Bundles & Cart Rescue":
                       hover_data=["sessions_added_to_cart", "sessions_purchased"])
         fig2.update_layout(height=max(350, 24 * len(rv)), yaxis_title=None,
                            xaxis_title="Carts without a purchase", margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
         t = rv[["item_name", "item_category", "typical_price", "sessions_added_to_cart",
                 "sessions_purchased", "cart_to_buy_rate", "abandoned_carts"]].copy()
         t["cart_to_buy_rate"] = (t["cart_to_buy_rate"] * 100).round(1)
         t.columns = ["Product", "Category", "Price $", "Cart sessions", "Purchase sessions",
                      "Cart→buy %", "Carts not bought"]
-        st.dataframe(t, use_container_width=True, hide_index=True)
+        st.dataframe(t, width="stretch", hide_index=True)
         st.caption("A product can land here because of price, shipping surprise, or checkout "
                    "friction. The data shows where carts are lost, not why. Products whose "
                    "purchases appear under a different spelling are excluded.")
@@ -483,128 +674,1459 @@ elif page == "Bundles & Cart Rescue":
 # ---------------------------------------------------------------------------
 # BANNER PERFORMANCE (B4)
 # ---------------------------------------------------------------------------
-elif page == "Banner Performance":
-    st.title("Banner Performance")
-    st.markdown(
-        "A **banner** is a promo box on the store. This page answers one question: "
-        "**when shoppers click a banner, do they go on to buy?**"
-    )
-    bn = load_banners()
-    if bn is None:
-        st.info("`data/banner_performance.csv` not found. Run `extract_banners.sql` in "
-                "BigQuery, download the result and save it as `data/banner_performance.csv`.")
-        st.stop()
-
-    MIN_CLICKERS = 100
-    bn = bn.copy()
-    bn["banner"] = bn["banner"].astype(str)
-    bn["buy_rate"] = bn["buyers"] / bn["click_users"].where(bn["click_users"] > 0)
-    ranges = [wilson_range(r.buyers, r.click_users) for r in bn.itertuples()]
-    bn["low"] = [x[0] for x in ranges]
-    bn["high"] = [x[1] for x in ranges]
-    main_bn = bn[bn["click_users"] >= MIN_CLICKERS].sort_values("buy_rate", ascending=False)
-    small_bn = bn[bn["click_users"] < MIN_CLICKERS]
-
-    # ---- 1. the answer, in plain words ----
-    best = main_bn.iloc[0]
-    overlap_all = all(best["low"] <= r.high for r in main_bn.iloc[1:].itertuples())
-    st.markdown("### The short answer")
-    lo, hi = main_bn["buy_rate"].min(), main_bn["buy_rate"].max()
-    st.markdown(
-        f"- Out of every 100 people who click one of these banners, about **{lo * 100:.0f} to "
-        f"{hi * 100:.0f}** go on to buy something.\n"
-        + ("- The banners are **close to each other**: the gaps are small enough that they could "
-           "be chance, so no banner is clearly better at turning clicks into sales.\n"
-           if overlap_all else
-           f"- *{best['banner']}* is the best at turning clicks into sales "
-           f"({best['buy_rate']:.1%}), and the gap to the others is larger than chance.\n")
-        + "- So the real difference between banners is **how many people click**, "
-          "not what the clickers do afterwards."
-    )
-
-    # ---- 2. one simple chart ----
-    st.markdown("### Out of 100 people who clicked, how many later bought?")
-    fig = px.bar(main_bn.iloc[::-1], x=main_bn.iloc[::-1]["buy_rate"] * 100, y="banner",
-                 orientation="h", text=(main_bn.iloc[::-1]["buy_rate"] * 100).round(1).astype(str) + "%")
-    fig.update_traces(
-        marker_color="#2ecc71",
-        error_x=dict(type="data", symmetric=False,
-                     array=((main_bn.iloc[::-1]["high"] - main_bn.iloc[::-1]["buy_rate"]) * 100).tolist(),
-                     arrayminus=((main_bn.iloc[::-1]["buy_rate"] - main_bn.iloc[::-1]["low"]) * 100).tolist()),
-        textposition="inside", insidetextanchor="start", textfont=dict(color="white", size=14),
-    )
-    fig.update_layout(height=60 * len(main_bn) + 120, yaxis_title=None,
-                      xaxis_title="People who bought per 100 who clicked",
-                      margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("The thin black line on each bar is the range we are 95% sure the true value "
-               "falls in. When two bars' lines overlap, the banners are not clearly different.")
-
-    # ---- 3. the numbers behind it ----
-    st.markdown("### The numbers behind it")
-    t = main_bn[["banner", "views", "clicks", "click_users", "buyers", "buy_rate"]].copy()
-    t["buy_rate"] = (t["buy_rate"] * 100).round(1).astype(str) + "%"
-    t.columns = ["Banner", "Times shown", "Clicks", "People who clicked",
-                 "Of those, bought later", "Buy rate"]
-    st.dataframe(t, use_container_width=True, hide_index=True)
-    st.download_button("Download this table (CSV)", t.to_csv(index=False), "banner_performance_table.csv")
-
-    # ---- 4. is the big banner worth the slot? ----
-    ok = main_bn[main_bn["clicks"] <= 0.2 * main_bn["views"]]
-    st.markdown("### Is the biggest banner worth its slot?")
-    if len(ok):
-        r = ok.sort_values("views", ascending=False).iloc[0]
-        per_1000 = r["clicks"] / r["views"] * 1000
-        others = main_bn[main_bn["banner"] != r["banner"]]
-        if len(others):
-            o = others.sort_values("clicks", ascending=False).iloc[0]
-            _cmp = (f"For comparison, *{o['banner']}* got **{o['clicks']:,.0f} clicks** "
-                    f"(similar), so the extra views did not translate into extra clicks "
-                    f"by that measure.")
-        else:
-            _cmp = ""
-        st.markdown(
-            f"*{r['banner']}* was shown **{r['views']:,.0f} times** but clicked only "
-            f"**{r['clicks']:,.0f} times**, about **{per_1000:.0f} clicks for every 1,000 views**. "
-            f"{_cmp}"
-        )
-    st.caption("For the smaller banners the 'times shown' looks too low (nearly as many clicks as "
-               "views), probably because they are clicked from places that do not log a view. "
-               "So compare banners by **clicks and buyers**, not by views.")
-
-    if len(small_bn):
-        with st.expander(f"{len(small_bn)} other banner entries left out (fewer than {MIN_CLICKERS} people clicked)"):
-            st.dataframe(small_bn[["banner", "views", "clicks", "click_users", "buyers"]],
-                         use_container_width=True, hide_index=True)
-
-    st.caption("'Bought later' = the person bought something after first clicking the banner. "
-               "It does not prove the banner caused the purchase; people who click banners may "
-               "already have planned to buy. One holiday season of one store.")
+elif page == "Promo Check":
+    st.title("Promo Check")
+    st.info("Becoming Banner Performance (B4) — not tonight's scope. Raw data below.")
+    df = load_promo_check()
+    st.dataframe(df.head(20), width="stretch")
 
 # ---------------------------------------------------------------------------
 # SEASON PLAYBOOK (placeholder — Person A's A2, not tonight's scope)
 # ---------------------------------------------------------------------------
 elif page == "Season Playbook":
     st.title("Season Playbook")
-    st.info("Person A's build (A2) — not tonight's scope. Raw data below.")
+    st.caption(
+        "Explore historical holiday demand and plan when to feature products."
+    )
+
     df = load_weekly()
-    st.dataframe(df.head(20), use_container_width=True)
+
+    phase_order = [
+        "Early Nov",
+        "Black Friday / Cyber Monday",
+        "Mid-Dec",
+        "Post-Christmas",
+    ]
+
+    weekly_totals = (
+        df.groupby(["week_start", "phase"], as_index=False)
+        .agg(
+            views=("sessions_viewed", "sum"),
+            purchases=("sessions_purchased", "sum"),
+            revenue=("revenue", "sum"),
+        )
+    )
+
+    phase_summary = (
+        weekly_totals.groupby("phase", as_index=False)
+        .agg(
+            weeks=("week_start", "nunique"),
+            views=("views", "sum"),
+            purchases=("purchases", "sum"),
+            revenue=("revenue", "sum"),
+        )
+    )
+
+    phase_summary["purchase_view_ratio"] = (
+        phase_summary["purchases"] / phase_summary["views"]
+    ).where(phase_summary["views"] > 0)
+
+    phase_summary["purchases_per_week"] = (
+        phase_summary["purchases"] / phase_summary["weeks"]
+    )
+
+    phase_summary["revenue_per_week"] = (
+        phase_summary["revenue"] / phase_summary["weeks"]
+    )
+
+    phase_summary["phase"] = pd.Categorical(
+        phase_summary["phase"],
+        categories=phase_order,
+        ordered=True,
+    )
+
+    phase_summary = phase_summary.sort_values("phase")
+
+    st.markdown("### Historical holiday phase performance")
+
+    display_df = phase_summary[
+        [
+            "phase",
+            "weeks",
+            "views",
+            "purchases",
+            "revenue",
+            "purchase_view_ratio",
+            "purchases_per_week",
+            "revenue_per_week",
+        ]
+    ].copy()
+
+    display_df["purchase_view_ratio"] *= 100
+
+    display_df.columns = [
+        "Phase",
+        "Weeks",
+        "Views",
+        "Purchases",
+        "Revenue ($)",
+        "Purchase / View",
+        "Purchases / Week",
+        "Revenue / Week ($)",
+    ]
+
+    st.dataframe(
+        display_df,
+        hide_index=True,
+        column_config={
+            "Purchase / View": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="Historical purchases divided by product-view sessions.",
+            ),
+        },
+    )
+
+    st.markdown("### Weekly purchase trends")
+
+    fig = px.line(
+        weekly_totals.sort_values("week_start"),
+        x="week_start",
+        y="purchases",
+        markers=True,
+        labels={
+            "week_start": "Week beginning",
+            "purchases": "Purchase sessions",
+        },
+    )
+
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### Product-specific phase recommendations")
+
+    available_products = sorted(
+        df["item_name"].dropna().unique().tolist()
+    )
+    known_products = set(available_products)
+
+    shortlisted = list(dict.fromkeys(
+        product.get("item_name")
+        for product in st.session_state.shortlist.values()
+        if product.get("item_name") in known_products
+    ))
+
+    product_options = shortlisted + [
+        name for name in available_products
+        if name not in shortlisted
+    ]
+
+    selected_product = st.selectbox(
+        "Choose a product to analyze",
+        product_options,
+        key="season_product",
+    )
+
+    product_history = df[
+        df["item_name"] == selected_product
+    ].copy()
+
+    product_phase = (
+        product_history.groupby("phase", as_index=False)
+        .agg(
+            views=("sessions_viewed", "sum"),
+            purchases=("sessions_purchased", "sum"),
+            revenue=("revenue", "sum"),
+        )
+    )
+
+    # Divide by all calendar weeks in each phase, not only
+    # the weeks where this product has recorded activity.
+    phase_weeks = dict(zip(
+        phase_summary["phase"].astype(str),
+        phase_summary["weeks"],
+    ))
+
+    product_phase["weeks"] = (
+        product_phase["phase"].map(phase_weeks)
+    )
+
+    product_phase["purchases_per_week"] = (
+        product_phase["purchases"] / product_phase["weeks"]
+    )
+
+    product_phase["revenue_per_week"] = (
+        product_phase["revenue"] / product_phase["weeks"]
+    )
+
+    product_phase["purchase_view_ratio"] = (
+        product_phase["purchases"] / product_phase["views"]
+    ).where(product_phase["views"] > 0)
+
+    product_phase["phase"] = pd.Categorical(
+        product_phase["phase"],
+        categories=phase_order,
+        ordered=True,
+    )
+
+    product_phase = product_phase.sort_values("phase")
+
+    product_display = product_phase[
+        [
+            "phase",
+            "weeks",
+            "views",
+            "purchases",
+            "purchase_view_ratio",
+            "purchases_per_week",
+            "revenue_per_week",
+        ]
+    ].copy()
+
+    product_display["purchase_view_ratio"] *= 100
+
+    product_display.columns = [
+        "Phase",
+        "Weeks",
+        "Views",
+        "Purchases",
+        "Purchase / View (%)",
+        "Purchases / Week",
+        "Revenue / Week ($)",
+    ]
+
+    st.dataframe(
+        product_display,
+        hide_index=True,
+        column_config={
+            "Purchase / View (%)": st.column_config.NumberColumn(
+                format="%.2f%%",
+            ),
+            "Purchases / Week": st.column_config.NumberColumn(
+                format="%.1f",
+            ),
+            "Revenue / Week ($)": st.column_config.NumberColumn(
+                format="$%.2f",
+            ),
+        },
+    )
+
+    reliable_phases = product_phase[
+        (product_phase["views"] >= 100)
+        & (product_phase["purchases"] <= product_phase["views"])
+        & (product_phase["purchases"] >= 0)
+    ].copy()
+
+    if reliable_phases.empty:
+        st.warning(
+            "There is insufficient historical evidence to "
+            "recommend a phase for this product. A phase needs "
+            "at least 100 recorded views, with purchases not "
+            "exceeding views."
+        )
+    else:
+        best = reliable_phases.sort_values(
+            ["purchases_per_week", "revenue_per_week"],
+            ascending=False,
+        ).iloc[0]
+
+        st.info(
+            f"**Suggested historical phase to test: "
+            f"{best['phase']}**. "
+            f"This product averaged "
+            f"{best['purchases_per_week']:.1f} purchase "
+            f"sessions per week during that phase. "
+            f"Use this as a planning hypothesis, "
+            f"not a guaranteed result."
+        )
+
+    if not reliable_phases.empty:
+        recommended_phase = str(best["phase"])
+
+        matching_keys = [
+            key
+            for key, product in st.session_state.shortlist.items()
+            if product.get("item_name") == selected_product
+        ]
+
+        if matching_keys:
+            if st.button(
+                "Apply recommended phase to shortlist",
+                key=f"apply_season_{selected_product}",
+            ):
+                for item_key in matching_keys:
+                    st.session_state.shortlist[item_key][
+                        "holiday_phase"
+                    ] = recommended_phase
+
+                    # Allow the Shortlist Builder dropdown to use
+                    # the newly recommended phase.
+                    st.session_state.pop(
+                        f"phase_{item_key}", None
+                    )
+
+                st.success(
+                    f"Applied {recommended_phase} to "
+                    f"{selected_product} in your shortlist."
+                )
+
+        else:
+            if st.button(
+                "Add to shortlist with recommended phase",
+                key=f"add_season_{selected_product}",
+            ):
+                summary = load_product_summary()
+
+                match = summary[
+                    summary["item_name"] == selected_product
+                ]
+
+                if match.empty:
+                    st.error(
+                        "This product was not found in "
+                        "the product summary."
+                    )
+                else:
+                    product = match.iloc[0].to_dict()
+                    product["holiday_phase"] = recommended_phase
+
+                    add_to_shortlist(product)
+
+                    st.success(
+                        f"Added {selected_product} with "
+                        f"{recommended_phase} as its phase."
+                    )
+
+    st.markdown("### Product weekly sales trend")
+
+    product_trend = (
+        product_history.groupby("week_start", as_index=False)
+        .agg(
+            views=("sessions_viewed", "sum"),
+            purchases=("sessions_purchased", "sum"),
+            revenue=("revenue", "sum"),
+        )
+        .sort_values("week_start")
+    )
+
+    trend_fig = px.line(
+        product_trend,
+        x="week_start",
+        y="purchases",
+        markers=True,
+        hover_data={
+            "views": True,
+            "revenue": ":,.2f",
+        },
+        labels={
+            "week_start": "Week beginning",
+            "purchases": "Purchase sessions",
+            "views": "Product-view sessions",
+            "revenue": "Revenue ($)",
+        },
+        title=f"Weekly purchases: {selected_product}",
+    )
+
+    phase_shades = {
+        "Early Nov": "#DCEAF9",
+        "Black Friday / Cyber Monday": "#FCE5D6",
+        "Mid-Dec": "#E1F2E5",
+        "Post-Christmas": "#EEE4FA",
+    }
+
+    phase_labels = {
+        "Early Nov": "Early Nov",
+        "Black Friday / Cyber Monday": "BFCM",
+        "Mid-Dec": "Mid-Dec",
+        "Post-Christmas": "Post-Christmas",
+    }
+
+    for phase_name in phase_order:
+        phase_dates = df.loc[
+            df["phase"] == phase_name,
+            "week_start",
+        ]
+
+        if phase_dates.empty:
+            continue
+
+        phase_start = phase_dates.min()
+        phase_end = (
+            phase_dates.max() + pd.Timedelta(days=7)
+        )
+
+        trend_fig.add_vrect(
+            x0=phase_start,
+            x1=phase_end,
+            fillcolor=phase_shades[phase_name],
+            opacity=0.40,
+            line_width=0,
+            layer="below",
+        )
+
+        trend_fig.add_annotation(
+            x=phase_start,
+            y=1.04,
+            yref="paper",
+            text=phase_labels[phase_name],
+            showarrow=False,
+            xanchor="left",
+            font=dict(size=10),
+        )
+
+    trend_fig.update_layout(
+        height=450,
+        hovermode="x unified",
+        margin=dict(t=85),
+    )
+
+    st.markdown("#### Historical USPS shipping deadlines")
+
+    usps_deadlines = {
+        "Retail Ground — Dec 15": "2020-12-15",
+        "First-Class Package — Dec 18": "2020-12-18",
+        "Priority Mail — Dec 19": "2020-12-19",
+        "Priority Mail Express — Dec 23": "2020-12-23",
+    }
+
+    selected_deadlines = st.multiselect(
+        "Show USPS 2020 mail-by dates on chart",
+        options=list(usps_deadlines),
+        default=[
+            "Retail Ground — Dec 15",
+            "Priority Mail — Dec 19",
+        ],
+        key="historical_usps_deadlines",
+    )
+
+    for index, service in enumerate(selected_deadlines):
+        cutoff = usps_deadlines[service]
+
+        trend_fig.add_shape(
+            type="line",
+            x0=cutoff,
+            x1=cutoff,
+            y0=0,
+            y1=1,
+            xref="x",
+            yref="paper",
+            line=dict(
+                color="#B42318",
+                width=2,
+                dash="dash",
+            ),
+        )
+
+        trend_fig.add_annotation(
+            x=cutoff,
+            xref="x",
+            y=0.94 - (index % 4) * 0.12,
+            yref="paper",
+            text=service,
+            showarrow=False,
+            xanchor="left",
+            bgcolor="rgba(255,255,255,0.85)",
+            font=dict(
+                size=10,
+                color="#B42318",
+            ),
+        )
+
+    st.plotly_chart(
+        trend_fig,
+        width="stretch",
+    )
+    st.caption(
+        "Historical USPS recommended mailing deadlines for "
+        "expected Christmas 2020 delivery are shown as red "
+        "dashed lines. These were not store order cutoffs "
+        "and do not establish why purchases changed. "
+        "Actual delivery was not guaranteed."
+    )
+
+    st.link_button(
+        "Source: USPS 2020 holiday shipping deadlines",
+        "https://about.usps.com/newsroom/national-releases/"
+        "2020/1008-usps-releases-deadlines-for-holiday-shipping.htm",
+    )
+
+
+
+    st.caption(
+        "Shaded regions represent historical holiday phases "
+        "from the 2020–2021 dataset. "
+        "Weekly figures describe recorded purchase sessions, "
+        "not forecasts of future sales."
+    )
+
+    st.markdown("### Seasonal launch schedule")
+
+    from datetime import date, timedelta
+
+    planning_year = st.number_input(
+        "Planning year",
+        min_value=2026,
+        max_value=2035,
+        value=2026,
+        step=1,
+    )
+
+    november_first = date(planning_year, 11, 1)
+
+    first_thursday = november_first + timedelta(
+        days=(3 - november_first.weekday()) % 7
+    )
+
+    thanksgiving = first_thursday + timedelta(weeks=3)
+    black_friday = thanksgiving + timedelta(days=1)
+    cyber_monday = black_friday + timedelta(days=3)
+
+    phase_windows = {
+        "Early Nov": (
+            date(planning_year, 11, 1),
+            thanksgiving - timedelta(days=1),
+        ),
+        "Black Friday / Cyber Monday": (
+            black_friday,
+            cyber_monday,
+        ),
+        "Mid-Dec": (
+            date(planning_year, 12, 7),
+            date(planning_year, 12, 24),
+        ),
+        "Post-Christmas": (
+            date(planning_year, 12, 26),
+            date(planning_year + 1, 1, 15),
+        ),
+    }
+
+    default_phase = (
+        str(best["phase"])
+        if not reliable_phases.empty
+        else "Early Nov"
+    )
+
+    selected_phase = st.selectbox(
+        "Phase to schedule",
+        phase_order,
+        index=phase_order.index(default_phase),
+        key=f"schedule_{selected_product}_{planning_year}",
+    )
+
+    start_date, end_date = phase_windows[selected_phase]
+
+    phase_actions = {
+        "Early Nov":
+            "Build awareness, test category placements, "
+            "and prepare promotional inventory.",
+        "Black Friday / Cyber Monday":
+            "Prioritize high-visibility promotional placements "
+            "and monitor stock and conversion.",
+        "Mid-Dec":
+            "Feature gifting products and verify shipping "
+            "cutoffs before promising holiday delivery.",
+        "Post-Christmas":
+            "Focus on clearance, gift-card shoppers, "
+            "and remaining inventory.",
+    }
+
+    st.write(
+        f"**Suggested planning window:** "
+        f"{start_date:%b %d, %Y} – {end_date:%b %d, %Y}"
+    )
+
+    st.info(phase_actions[selected_phase])
+
+    st.caption(
+        "These dates are illustrative rollout windows, "
+        "not the exact historical dataset boundaries. "
+        "Confirm inventory, promotion dates, and shipping "
+        "deadlines before launching."
+    )
+
+    st.markdown("### Christmas delivery cutoff check")
+
+    shipping_cutoff = st.date_input(
+        "Last order date for Christmas delivery",
+        value=None,
+        min_value=date(planning_year, 11, 1),
+        max_value=date(planning_year, 12, 24),
+        key=f"shipping_cutoff_{planning_year}",
+        help="Enter a deadline confirmed by your seller or carrier.",
+    )
+
+    if shipping_cutoff is None:
+        st.info(
+            "No shipping cutoff entered. Confirm the deadline "
+            "with your fulfillment or delivery provider."
+        )
+    elif start_date > shipping_cutoff:
+        st.warning(
+            f"The selected phase begins after the "
+            f"{shipping_cutoff:%b %d, %Y} shipping cutoff. "
+            "Avoid promising Christmas delivery."
+        )
+    elif end_date > shipping_cutoff:
+        st.warning(
+            f"This phase extends beyond the "
+            f"{shipping_cutoff:%b %d, %Y} cutoff. "
+            "Separate promotions before and after the deadline."
+        )
+    else:
+        st.success(
+            "The selected phase ends before or on the "
+            "entered shipping cutoff."
+        )
+
+    st.caption(
+        "This check uses a user-entered deadline. "
+        "It does not verify delivery availability, inventory, "
+        "processing time, or carrier service."
+    )
+
+
+
+    st.markdown("### Google Trends research")
+
+    st.write(
+        "Check whether recent search interest supports the "
+        "historical holiday recommendation."
+    )
+
+    from urllib.parse import urlencode
+
+    search_term = st.text_input(
+        "Google Trends search term",
+        value=selected_product,
+        key=f"trends_term_{selected_product}",
+        help="Use a broader product category if the exact item has little search data.",
+    )
+
+    if search_term.strip():
+        trends_url = (
+            "https://trends.google.com/trends/explore?"
+            + urlencode({
+                "date": "today 5-y",
+                "geo": "US",
+                "q": search_term.strip(),
+            })
+        )
+
+        st.link_button(
+            "Open Google Trends",
+            trends_url,
+        )
+
+    trend_signal = st.selectbox(
+        "Observed search-interest trend",
+        [
+            "Not reviewed",
+            "Rising",
+            "Stable",
+            "Declining",
+            "Insufficient data",
+        ],
+        key=f"trend_signal_{selected_product}",
+    )
+
+    trend_notes = st.text_area(
+        "Research notes",
+        placeholder=(
+            "Example: Search interest increases in November "
+            "and peaks in December."
+        ),
+        key=f"trend_notes_{selected_product}",
+    )
+
+    if trend_signal != "Not reviewed":
+        st.info(
+            f"Research observation: {trend_signal}. "
+            "Compare this signal with historical sales before "
+            "finalizing the merchandising schedule."
+        )
+
+    st.caption(
+        "Google Trends provides relative search interest, "
+        "not product sales. Research observations are entered "
+        "manually and retained only in the current app session."
+    )
+
+    st.markdown("### Google Trends data comparison")
+
+    trends_path = DATA_DIR / "google_trends_hoodie.csv"
+
+    if not trends_path.exists():
+        st.warning("Google Trends CSV not found in data/.")
+    else:
+        trends_raw = pd.read_csv(trends_path, skiprows=2)
+
+        interest_columns = [
+            column for column in trends_raw.columns
+            if column != "Month"
+        ]
+
+        if "Month" not in trends_raw.columns or len(interest_columns) != 1:
+            st.error("Unexpected Google Trends CSV format.")
+        else:
+            trends = pd.DataFrame({
+                "month": pd.to_datetime(
+                    trends_raw["Month"].astype(str) + "-01",
+                    errors="coerce",
+                ),
+                "interest": pd.to_numeric(
+                    trends_raw[interest_columns[0]],
+                    errors="coerce",
+                ),
+            }).dropna().sort_values("month")
+
+            st.caption(
+                "Source: Google Trends, US Web Search, "
+                "keyword 'hoodie'. CSV downloaded manually. "
+                "Scores represent relative interest, not "
+                "search counts or product purchases."
+            )
+
+            st.markdown("#### US search interest over time")
+
+            fig_trends = px.line(
+                trends,
+                x="month",
+                y="interest",
+                markers=True,
+                labels={
+                    "month": "Month",
+                    "interest": "Google Trends interest (0–100)",
+                },
+                title="US Google Trends — hoodie",
+            )
+
+            fig_trends.update_yaxes(range=[0, 105])
+            fig_trends.update_layout(height=400)
+
+            st.plotly_chart(fig_trends, width="stretch")
+
+            st.markdown("#### Holiday search timing comparison")
+
+            holiday_trends = trends.copy()
+
+            holiday_trends["year"] = (
+                holiday_trends["month"].dt.year
+            )
+
+            holiday_trends["month_number"] = (
+                holiday_trends["month"].dt.month
+            )
+
+            holiday_trends = holiday_trends[
+                holiday_trends["year"].isin([2020, 2025, 2026])
+                & holiday_trends["month_number"].between(10, 12)
+            ].copy()
+
+            holiday_trends["Holiday month"] = (
+                holiday_trends["month"].dt.strftime("%b")
+            )
+
+            holiday_trends["Year"] = (
+                holiday_trends["year"].astype(str)
+            )
+
+            fig_holiday = px.line(
+                holiday_trends,
+                x="Holiday month",
+                y="interest",
+                color="Year",
+                markers=True,
+                category_orders={
+                    "Holiday month": ["Oct", "Nov", "Dec"],
+                    "Year": ["2020", "2025", "2026"],
+                },
+                labels={
+                    "interest": "Google Trends interest (0–100)",
+                },
+                title="US hoodie searches: holiday seasons compared",
+            )
+
+            fig_holiday.update_yaxes(range=[0, 105])
+
+            fig_holiday.update_layout(
+                height=420,
+                hovermode="x unified",
+            )
+
+            st.plotly_chart(
+                fig_holiday,
+                width="stretch",
+            )
+
+            st.caption(
+                "The three years use the same relative-interest "
+                "scale from one Google Trends CSV export. "
+                "November 2026 is incomplete, and December "
+                "2026 is not yet available. Missing months "
+                "are not treated as zero searches."
+            )
+
+
+            st.markdown(
+                "#### Historical product demand vs search interest"
+            )
+
+            if "hoodie" not in selected_product.lower():
+                st.info(
+                    "The imported search keyword is 'hoodie'. "
+                    "For a different product category, import "
+                    "a relevant Google Trends keyword before "
+                    "interpreting the comparison."
+                )
+
+            sales_monthly = product_history.copy()
+
+            sales_monthly["month"] = (
+                sales_monthly["week_start"]
+                .dt.to_period("M")
+                .dt.to_timestamp()
+            )
+
+            sales_monthly = (
+                sales_monthly.groupby("month", as_index=False)
+                .agg(
+                    purchases=("sessions_purchased", "sum"),
+                )
+            )
+
+            comparison = sales_monthly.merge(
+                trends,
+                on="month",
+                how="inner",
+            )
+
+            comparison = comparison[
+                (comparison["month"] >= "2020-10-01")
+                & (comparison["month"] <= "2021-01-01")
+            ].sort_values("month")
+
+            if comparison.empty:
+                st.warning(
+                    "No overlapping historical months found."
+                )
+            else:
+                max_purchases = comparison["purchases"].max()
+                max_interest = comparison["interest"].max()
+
+                comparison["Product purchase index"] = (
+                    comparison["purchases"] / max_purchases * 100
+                    if max_purchases > 0 else 0.0
+                )
+
+                comparison["US hoodie search index"] = (
+                    comparison["interest"] / max_interest * 100
+                    if max_interest > 0 else 0.0
+                )
+
+                comparison["Month"] = (
+                    comparison["month"].dt.strftime("%b %Y")
+                )
+
+                comparison_chart = comparison[
+                    [
+                        "Month",
+                        "Product purchase index",
+                        "US hoodie search index",
+                    ]
+                ].melt(
+                    id_vars="Month",
+                    var_name="Series",
+                    value_name="Index",
+                )
+
+                fig_compare = px.line(
+                    comparison_chart,
+                    x="Month",
+                    y="Index",
+                    color="Series",
+                    markers=True,
+                    title=(
+                        f"2020–2021 seasonal comparison: "
+                        f"{selected_product}"
+                    ),
+                )
+
+                fig_compare.update_yaxes(range=[0, 105])
+                fig_compare.update_layout(height=400)
+
+                st.plotly_chart(fig_compare, width="stretch")
+
+                st.caption(
+                    "Each series is independently rescaled to "
+                    "a maximum of 100 over the overlapping months. "
+                    "Monthly product purchases are grouped using "
+                    "the week-start date. This is an exploratory "
+                    "seasonality comparison, not evidence that "
+                    "search interest causes purchases."
+                )
+
+            st.caption(
+                "November 2026 may be incomplete. "
+                "The CSV is a downloaded snapshot, "
+                "not an automatically updating live feed."
+            )
+
+
+    st.caption(
+        "Phase recommendation uses historical purchase "
+        "activity per calendar week. The 100-view threshold "
+        "is a minimum screening rule, not proof of statistical "
+        "reliability."
+    )
+
+    st.caption(
+        "Historical data: October 2020–January 2021. "
+        "Phases cover different numbers of weeks. "
+        "Purchase/view ratios use aggregated product-level sessions "
+        "and should not be treated as unique-shopper conversion rates."
+    )
 
 # ---------------------------------------------------------------------------
 # SHORTLIST BUILDER (placeholder — Person A's A1, not tonight's scope)
 # ---------------------------------------------------------------------------
+
+
 elif page == "Shortlist Builder":
     st.title("Shortlist Builder")
-    st.info("Person A's main deliverable (A1) — not tonight's scope.")
-    if st.session_state.shortlist:
-        st.markdown(f"**{len(st.session_state.shortlist)} products added so far from Scorecard / Opportunity Finder:**")
-        st.dataframe(
-            pd.DataFrame(st.session_state.shortlist.values()).reindex(
-                columns=["item_name", "item_category", "slot", "paired_with",
-                         "sessions_viewed", "view_to_buy_rate", "revenue", "label"]
-            ),
-            use_container_width=True,
+
+    # Recommended merchandising shortlist size: 10–15 products.
+    selected_count = len(st.session_state.shortlist)
+
+    if 0 < selected_count < 10:
+        st.info(
+            f"You have selected {selected_count} products. "
+            f"Add at least {10 - selected_count} more to reach "
+            "the recommended 10–15 product range."
         )
-        st.caption("This list carries over once Person A builds the real Shortlist Builder (phase assignment, slot, replaces, test plan, export).")
+    elif 10 <= selected_count <= 15:
+        st.success(
+            f"Your {selected_count}-product shortlist is within "
+            "the recommended 10–15 product range."
+        )
+    elif selected_count > 15:
+        st.warning(
+            f"You have selected {selected_count} products. "
+            f"Consider removing {selected_count - 15} to stay "
+            "within the recommended 10–15 product range."
+        )
+
+
+
+    if st.session_state.shortlist:
+
+        phase_options = [
+            "Early Nov",
+            "Black Friday / Cyber Monday",
+            "Mid-Dec",
+            "Post-Christmas",
+        ]
+
+        slot_options = [
+            "Homepage",
+            "Category page",
+            "Promo banner",
+            "Cart add-on",
+        ]
+        summary_df = load_product_summary()
+
+        st.markdown("### Assign holiday phases and placements")
+
+        # Add planning controls for every shortlisted product.
+        for shortlist_key, product in list(
+            st.session_state.shortlist.items()
+        ):
+
+            # Set default values without overwriting previous selections.
+            phase_aliases = {
+                "Black Friday": "Black Friday / Cyber Monday",
+                "Mid-December": "Mid-Dec",
+            }
+
+            saved_phase = product.get("holiday_phase")
+            product["holiday_phase"] = phase_aliases.get(
+                saved_phase, saved_phase
+            )
+
+            if product["holiday_phase"] not in phase_options:
+                product["holiday_phase"] = "Black Friday / Cyber Monday"
+
+            if product.get("placement_slot") not in slot_options:
+                old_slot = str(product.get("slot") or "").strip().lower()
+
+                slot_aliases = {
+                    "homepage": "Homepage",
+                    "category page": "Category page",
+                    "banner": "Promo banner",
+                    "promo banner": "Promo banner",
+                    "cart add-on": "Cart add-on",
+                }
+
+                product["placement_slot"] = slot_aliases.get(
+                    old_slot, "Homepage"
+                )
+
+            with st.container(border=True):
+
+                product_name = product.get(
+                    "item_name", shortlist_key
+                )
+
+                st.markdown(f"**{product_name}**")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    phase = st.selectbox(
+                        "Holiday phase",
+                        options=phase_options,
+                        index=phase_options.index(
+                            product["holiday_phase"]
+                        ),
+                        key=f"phase_{shortlist_key}",
+                    )
+
+                with col2:
+                    slot = st.selectbox(
+                        "Placement slot",
+                        options=slot_options,
+                        index=slot_options.index(
+                            product["placement_slot"]
+                        ),
+                        key=f"slot_{shortlist_key}",
+                    )
+
+                # Save the selected planning information.
+                product["holiday_phase"] = phase
+                product["placement_slot"] = slot
+                product["slot"] = slot
+
+
+                # Select a weaker product to replace.
+                if slot == "Cart add-on":
+                    product["replacement_product"] = None
+                    st.caption(
+                        "Cart add-ons complement an anchor product "
+                        "and do not replace a homepage or category slot."
+                    )
+
+                else:
+                    category = product.get("item_category")
+
+                    candidates = summary_df[
+                        (summary_df["item_category"] == category)
+                        & summary_df["label"].isin(
+                            ["Window-Shopper", "Low Priority"]
+                        )
+                        & (summary_df["item_name"] != product_name)
+                    ].copy()
+
+                    candidates = candidates.sort_values(
+                        "view_to_buy_rate",
+                        ascending=True,
+                        na_position="last",
+                    )
+
+                    candidate_names = (
+                        candidates["item_name"].dropna().tolist()
+                    )
+
+                    replacement_options = [
+                        "No replacement"
+                    ] + candidate_names
+
+
+
+
+                    suggested = product.get("replaces")
+
+                    if suggested is not None and pd.isna(suggested):
+                        suggested = None
+
+                    saved_replacement = product.get("replacement_product")
+
+                    if saved_replacement is not None and pd.isna(saved_replacement):
+                        saved_replacement = None
+
+                    current = saved_replacement or suggested or "No replacement"
+
+                    if current not in replacement_options:
+                        current = "No replacement"
+
+                    replacement = st.selectbox(
+                        "Product to replace",
+                        options=replacement_options,
+                        index=replacement_options.index(current),
+                        key=f"replacement_{shortlist_key}",
+                    )
+
+                    product["replacement_product"] = (
+                        None
+                        if replacement == "No replacement"
+                        else replacement
+                    )
+
+                    if suggested:
+                        st.caption(
+                            f"Opportunity Finder suggestion: {suggested}"
+                        )
+
+                    if not candidate_names:
+                        st.info(
+                            "No eligible weaker products were found "
+                            "in this category."
+                        )
+
+                # Two-week A/B testing recommendation
+                st.markdown("**Two-week test plan**")
+
+                baseline_rate = product.get("view_to_buy_rate")
+
+                required_per_variant = required_visits_per_variant(
+                    baseline_rate
+                )
+
+                if required_per_variant is None:
+                    st.info(
+                        "Testing traffic estimate unavailable because "
+                        "this product does not have a valid historical "
+                        "conversion rate."
+                    )
+
+                else:
+                    total_visits = required_per_variant * 2
+                    daily_target = math.ceil(
+                        required_per_variant / 14
+                    )
+
+                    target_rate = min(
+                        float(baseline_rate) * 1.20,
+                        0.999999
+                    )
+
+                    st.write(
+                        f"Historical conversion: "
+                        f"{float(baseline_rate):.1%}"
+                    )
+
+                    st.write(
+                        f"Target conversion: {target_rate:.1%} "
+                        f"(20% relative improvement)"
+                    )
+
+                    st.write(
+                        f"Required traffic: "
+                        f"{required_per_variant:,} visits per variant "
+                        f"({total_visits:,} combined)"
+                    )
+
+                    st.write(
+                        f"Daily target: approximately "
+                        f"{daily_target:,} visits per variant "
+                        f"for 14 days."
+                    )
+
+                st.caption(
+                    "Estimate assumes a two-sided test, 95% confidence "
+                    "and 80% statistical power. Actual results may differ."
+                )
+
+
+
+        # Refresh the table using the updated product information.
+        shortlist_df = pd.DataFrame(
+            list(st.session_state.shortlist.values())
+        )
+
+        price_df = load_product_prices()
+
+        shortlist_df = shortlist_df.merge(
+            price_df,
+            on="item_name",
+            how="left",
+        )
+
+        # Add testing estimates to the exportable plan.
+        if "view_to_buy_rate" in shortlist_df.columns:
+            baseline_rates = pd.to_numeric(
+                shortlist_df["view_to_buy_rate"],
+                errors="coerce",
+            )
+        else:
+            baseline_rates = pd.Series(
+                float("nan"),
+                index=shortlist_df.index,
+            )
+
+        shortlist_df["test_baseline_rate"] = baseline_rates
+
+        shortlist_df["test_visits_per_variant"] = (
+            baseline_rates.apply(required_visits_per_variant)
+        )
+
+        visits_numeric = pd.to_numeric(
+            shortlist_df["test_visits_per_variant"],
+            errors="coerce",
+        )
+
+        shortlist_df["test_target_rate"] = (
+            baseline_rates * 1.20
+        ).clip(upper=0.999999).where(visits_numeric.notna())
+
+        shortlist_df["test_total_visits"] = visits_numeric * 2
+
+        shortlist_df["test_daily_visits_per_variant"] = (
+            visits_numeric.apply(
+                lambda value: math.ceil(value / 14)
+                if pd.notna(value) else None
+            )
+        )
+
+
+        priced_count = int(
+            shortlist_df["typical_price"].notna().sum()
+        )
+
+        unknown_count = len(shortlist_df) - priced_count
+
+        # ---------------- Plan mix calculations ----------------
+
+        total_products = len(shortlist_df)
+
+        # Category distribution
+        category_mix = (
+            shortlist_df["item_category"]
+            .fillna("Unknown category")
+            .value_counts()
+            .rename_axis("Category")
+            .reset_index(name="Products")
+        )
+
+        category_mix["Share (%)"] = (
+            category_mix["Products"] / total_products * 100
+        ).round(1)
+
+        # Price distribution using typical historical transaction prices
+        numeric_prices = pd.to_numeric(
+            shortlist_df["typical_price"],
+            errors="coerce"
+        )
+
+        price_bands = pd.cut(
+            numeric_prices,
+            bins=[
+                float("-inf"),
+                10,
+                25,
+                50,
+                float("inf")
+            ],
+            labels=[
+                "Under $10",
+                "$10–$24.99",
+                "$25–$49.99",
+                "$50+"
+            ],
+            right=False
+        )
+
+        price_mix = (
+            price_bands.astype("object")
+            .fillna("Unknown")
+            .value_counts()
+            .rename_axis("Price band")
+            .reset_index(name="Products")
+        )
+
+        price_mix["Share (%)"] = (
+            price_mix["Products"] / total_products * 100
+        ).round(1)
+
+        # Identify picks with weak or incomplete performance data
+        weak_data = pd.Series(
+            False,
+            index=shortlist_df.index
+        )
+
+        for flag in [
+            "views_likely_insufficient",
+            "purchases_unmatched"
+        ]:
+            if flag in shortlist_df.columns:
+                weak_data |= (
+                    shortlist_df[flag]
+                    .fillna(True)
+                    .astype(bool)
+                )
+            else:
+                weak_data |= True
+
+        for metric in [
+            "sessions_viewed",
+            "view_to_buy_ci_low"
+        ]:
+            if metric in shortlist_df.columns:
+                weak_data |= pd.to_numeric(
+                    shortlist_df[metric],
+                    errors="coerce"
+                ).isna()
+            else:
+                weak_data |= True
+
+        if "label" in shortlist_df.columns:
+            weak_data |= shortlist_df["label"].eq(
+                "Not Enough Data"
+            ).fillna(False)
+
+        weak_count = int(weak_data.sum())
+
+
+        st.divider()
+        st.markdown("### Plan overview")
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric("Products selected", total_products)
+
+        c2.metric("Products with price data", priced_count)
+
+        c3.metric(
+            "Picks with weak data",
+            f"{weak_count}/{total_products}"
+        )
+
+        st.markdown("### Category and price mix")
+
+        mix_col1, mix_col2 = st.columns(2)
+
+        with mix_col1:
+            st.markdown("**Category distribution**")
+            st.bar_chart(
+                category_mix.set_index("Category")["Products"]
+            )
+            st.dataframe(
+                category_mix,
+                width="stretch",
+                hide_index=True
+            )
+
+        with mix_col2:
+            st.markdown("**Price distribution**")
+            st.bar_chart(
+                price_mix.set_index("Price band")["Products"]
+            )
+            st.dataframe(
+                price_mix,
+                width="stretch",
+                hide_index=True
+            )
+
+        st.caption(
+            "Price bands use median historical transaction prices. "
+            "Unknown prices are shown separately."
+        )
+
+        if weak_count:
+            st.warning(
+                f"{weak_count} of {total_products} picks rely on "
+                "weak or incomplete performance data. "
+                "Cart add-ons without product-level view metrics "
+                "are also included."
+            )
+        else:
+            st.success(
+                "All selected products have sufficient performance data."
+            )
+
+        st.markdown("### Your selected products")
+
+        display_columns = [
+            "item_name",
+            "item_category",
+            "typical_price",
+            "min_price",
+            "max_price",
+            "holiday_phase",
+            "placement_slot",
+            "paired_with",
+            "replaces",
+            "sessions_viewed",
+            "sessions_purchased",
+            "view_to_buy_rate",
+            "view_to_buy_ci_low",
+            "revenue",
+            "label",
+            "replacement_product",
+            "test_visits_per_variant",
+            "test_total_visits",
+            "test_daily_visits_per_variant",
+        ]
+
+        st.dataframe(
+            shortlist_df.reindex(columns=display_columns),
+            width="stretch",
+            hide_index=True,
+        )
+
+        # Export the complete merchandising plan.
+        export_columns = [
+            "item_name",
+            "item_category",
+            "typical_price",
+            "min_price",
+            "max_price",
+            "holiday_phase",
+            "placement_slot",
+            "paired_with",
+            "replacement_product",
+            "replaces",
+            "sessions_viewed",
+            "sessions_purchased",
+            "view_to_buy_rate",
+            "view_to_buy_ci_low",
+            "view_to_buy_ci_high",
+            "revenue",
+            "label",
+            "test_baseline_rate",
+            "test_target_rate",
+            "test_visits_per_variant",
+            "test_total_visits",
+            "test_daily_visits_per_variant",
+        ]
+
+        csv_data = (
+            shortlist_df.reindex(columns=export_columns)
+            .to_csv(index=False)
+            .encode("utf-8-sig")
+        )
+
+        st.download_button(
+            "Download shelf plan (CSV)",
+            data=csv_data,
+            file_name="holiday_shelf_plan.csv",
+            mime="text/csv",
+        )
+
+        pdf_data = build_shelf_brief_pdf(
+            shortlist_df,
+            category_mix,
+            price_mix,
+            weak_count,
+        )
+
+        st.download_button(
+            "Download one-page brief (PDF)",
+            data=pdf_data,
+            file_name="holiday_shelf_brief.pdf",
+            mime="application/pdf",
+        )
+
+
+        st.caption(
+            "Typical price is the median recorded transaction price. "
+            "Minimum and maximum show the observed historical price range."
+        )
+
+        if unknown_count:
+            st.warning(
+                f"{unknown_count} selected product(s) have no matching "
+                "transaction-price data."
+            )
+
     else:
-        st.caption("No products added yet — use the '+ Add' buttons on Scorecard or Opportunity Finder.")
+        st.info(
+            "Your shortlist is empty. Add products from the "
+            "Shelf Scorecard or Opportunity Finder."
+        )
