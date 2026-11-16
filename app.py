@@ -217,8 +217,20 @@ def load_weekly():
 
 
 @st.cache_data
-def load_promo_check():
-    return pd.read_csv(DATA_DIR / "promo_check.csv")
+def load_banners():
+    path = DATA_DIR / "banner_performance.csv"
+    return pd.read_csv(path) if path.exists() else None
+
+
+def wilson_range(successes, n, z=1.96):
+    """95% range for a rate (e.g. share of clickers who later bought)."""
+    if n <= 0:
+        return 0.0, 0.0
+    p = successes / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2 * n)) / denom
+    margin = z * ((p * (1 - p) + z**2 / (4 * n)) / n) ** 0.5 / denom
+    return max(center - margin, 0.0), min(center + margin, 1.0)
 
 
 if "shortlist" not in st.session_state:
@@ -254,7 +266,7 @@ def remove_from_shortlist(item_name: str):
 st.sidebar.title("Holiday Shelf")
 page = st.sidebar.radio(
     "Go to",
-    ["Shelf Scorecard", "Opportunity Finder", "Bundles & Cart Rescue", "Promo Check", "Season Playbook", "Shortlist Builder"],
+    ["Shelf Scorecard", "Opportunity Finder", "Bundles & Cart Rescue", "Banner Performance", "Season Playbook", "Shortlist Builder"],
 )
 
 st.sidebar.markdown("---")
@@ -660,7 +672,7 @@ elif page == "Bundles & Cart Rescue":
                    "purchases appear under a different spelling are excluded.")
 
 # ---------------------------------------------------------------------------
-# PROMO CHECK (placeholder — Person B's B4, not tonight's scope)
+# BANNER PERFORMANCE (B4)
 # ---------------------------------------------------------------------------
 elif page == "Promo Check":
     st.title("Promo Check")
