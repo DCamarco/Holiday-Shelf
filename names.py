@@ -1,6 +1,6 @@
 """
 
-1. data/name_crosswalk.csv  (built FROM THE DATA by find_name_crosswalk.sql)
+1. data/name_crosswalk.csv  (built FROM THE DATA by sql/04_find_name_crosswalk.sql)
    Looks at sessions where a shopper added product A to the cart and then bought
    product B, where B has (almost) no cart events of its own. If one A accounts for
    most of B's purchase sessions, has the same price, and clearly beats the runner-up,

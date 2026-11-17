@@ -758,7 +758,7 @@ elif page == "Banner Performance":
     )
     bn = load_banners()
     if bn is None:
-        st.info("`data/banner_performance.csv` not found. Run `extract_banners.sql` in "
+        st.info("`data/banner_performance.csv` not found. Run `sql/03_extract_banners.sql` in "
                 "BigQuery, download the result and save it as `data/banner_performance.csv`.")
         st.stop()
 

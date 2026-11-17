@@ -2,7 +2,7 @@
 Holiday Shelf: Bundles & Cart Rescue data builder (B3)
 
 Run:  python build_bundles.py
-Reads:  data/orders_v2.csv        (from extract_bundles.sql: one row per order x product)
+Reads:  data/orders_v2.csv        (from sql/02_extract_orders.sql: one row per order x product)
         data/product_summary.csv  (from pipeline.py)
 Writes: data/bundle_pairs.csv     (bought-together pairs with strength metrics)
         data/cart_rescue.csv      (products added to cart often but rarely bought)
@@ -131,7 +131,7 @@ def build_cart_rescue(summary: pd.DataFrame, orders: pd.DataFrame) -> pd.DataFra
 def main():
     orders_path = DATA_DIR / "orders_v2.csv"
     if not orders_path.exists():
-        print(f"ERROR: {orders_path} not found. Run extract_bundles.sql in BigQuery first.")
+        print(f"ERROR: {orders_path} not found. Run sql/02_extract_orders.sql in BigQuery first.")
         return
     orders = pd.read_csv(orders_path)
     # Same spelling fixes the pipeline applies (names.py), so order names line up

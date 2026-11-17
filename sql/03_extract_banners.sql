@@ -1,7 +1,8 @@
--- Holiday Shelf: banner performance extraction (B4)
+-- Holiday Shelf | Query 3 of 4: banner performance
 --
 -- Run in the BigQuery console (billing project holiday-shelf-110920130).
 -- Download as CSV and save as:  data/banner_performance.csv
+-- Used by: the Banner Performance page in app.py
 --
 -- One row per banner (promotion_name) with the funnel the Banner Performance page draws:
 --   views        = number of view_promotion events (banner shown)

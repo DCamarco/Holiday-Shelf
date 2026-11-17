@@ -4,11 +4,11 @@ Holiday Shelf — data pipeline (replaces the old pipeline.py AND pipeline_v2.py
 Fixes the item_id mismatch bug: view_item events used a different ID namespace
 than add_to_cart/purchase events for the same product, which made the old
 pipeline think most products had zero views. This version joins on item_name
-(set at extraction time, in extract_corrected.sql) instead. Remaining spelling
+(set at extraction time, in sql/01_extract_events.sql) instead. Remaining spelling
 differences between cart and purchase events are fixed in names.py.
 
 Run: python pipeline.py
-Reads from ./data/raw_events_v2.csv  (the output of extract_corrected.sql)
+Reads from ./data/raw_events_v2.csv  (the output of sql/01_extract_events.sql)
 Writes to ./data/*.csv
 
 Also prints an old-vs-new comparison against the existing ./data/product_summary.csv
@@ -227,7 +227,7 @@ def compare_old_vs_new(new_summary: pd.DataFrame, old: pd.DataFrame | None):
 def main():
     if not RAW_PATH.exists():
         print(f"ERROR: {RAW_PATH} not found.")
-        print("Run extract_corrected.sql in the BigQuery console first, download the")
+        print("Run sql/01_extract_events.sql in the BigQuery console first, download the")
         print(f"result, and save it as {RAW_PATH} before running this script.")
         return
 
