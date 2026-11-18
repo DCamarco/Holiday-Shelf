@@ -1,0 +1,44 @@
+# Keeps this fork's main up to date with the team repo (hkoradiy-dev/Holiday-Shelf).
+# Streamlit Community Cloud redeploys automatically whenever main changes here.
+#
+# GitHub can't notify a fork when the original repo changes, so this checks
+# on a schedule. Run it by hand from the Actions tab with "Run workflow".
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/hkoradiy-dev/Holiday-Shelf.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            exit 0
+          fi
+
+          # Merge (not reset) so this workflow file, which only exists in the fork, is kept.
+          # A conflict fails the run; fix it locally and push to the fork.
+          git merge --no-edit upstream/main
+          git push origin main
