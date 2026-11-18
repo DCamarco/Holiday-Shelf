@@ -11,3 +11,6 @@ __pycache__/
 # Development backups
 app.py.backup
 app.py.before_*
+
+# Streamlit secrets (API keys) — never commit
+.streamlit/secrets.toml

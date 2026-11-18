@@ -11,7 +11,14 @@ from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from shared import load_product_prices, load_product_summary
+import ai_panel
+from shared import (
+    load_pairs,
+    load_product_prices,
+    load_product_summary,
+    load_rescue,
+    load_weekly,
+)
 
 
 def required_visits_per_variant(
@@ -613,6 +620,12 @@ def render():
             st.success(
                 "All selected products have sufficient performance data."
             )
+
+        # Person C: AI plan review (rule checks + Gemini). See AI_PLAN.md.
+        ai_panel.render_plan_review(
+            st.session_state.shortlist, summary_df, load_weekly(),
+            load_pairs(), load_rescue(), price_df,
+        )
 
         st.markdown("### Your selected products")
 
