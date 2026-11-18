@@ -14,7 +14,9 @@ A merchandising planner for the holiday season. It turns a year of shopper behav
 
 ## App Deployment URL
 
-[Add deployed app link here]
+**Live app:** https://holiday-shelf-smxgwbmusftrhvsyfibqby.streamlit.app/
+
+Hosted on Streamlit Community Cloud from the fork [DCamarco/Holiday-Shelf](https://github.com/DCamarco/Holiday-Shelf), which pulls in this repo's `main` automatically every 30 minutes and redeploys. The AI plan review needs `GEMINI_API_KEY`, `GEMINI_MODEL` and `GEMINI_VERTEXAI` in the app's Secrets settings; without them it shows the rule checks only.
 
 ## Local Setup Instructions
 
