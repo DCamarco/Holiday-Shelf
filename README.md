@@ -109,7 +109,16 @@ python build_bundles.py     # bundle_pairs.csv, cart_rescue.csv
 ## Project Structure
 
 ```
-app.py                  Streamlit app (all pages)
+app.py                  Entry point: page setup, sidebar and navigation only
+views/                  One file per page. Each has a render() function; edit a page here
+  overview.py
+  shelf_scorecard.py
+  opportunity_finder.py
+  bundles_cart_rescue.py
+  banner_performance.py
+  season_playbook.py
+  shortlist_builder.py  Also holds the A/B test calculator and the PDF brief
+shared.py               Data loaders and shortlist helpers used by every page
 ui.py                   Look and feel: light and dark themes, cards, chart colours
 pipeline.py             Cleans raw events; builds the product summary and weekly data
 names.py                Product-name fixes shared by the pipeline scripts
@@ -121,6 +130,8 @@ tests/                  Automated tests
 requirements.txt        Python dependencies
 REPORT.MD               Project report
 ```
+
+To change a page, open its file in `views/`. To add a page, create a new file in `views/` with a `render()` function and add one line to the `PAGES` list in `app.py`.
 
 ## Known Limitations
 

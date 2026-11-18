@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_pdf_builder():
     """Load the PDF function without launching Streamlit."""
-    tree = ast.parse((ROOT / "app.py").read_text())
+    tree = ast.parse((ROOT / "views" / "shortlist_builder.py").read_text())
 
     matches = [
         node for node in tree.body
@@ -35,7 +35,7 @@ def load_pdf_builder():
     module = ast.Module(body=matches, type_ignores=[])
 
     exec(
-        compile(module, str(ROOT / "app.py"), "exec"),
+        compile(module, str(ROOT / "views" / "shortlist_builder.py"), "exec"),
         namespace,
     )
 

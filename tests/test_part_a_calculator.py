@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_calculator():
     """Load the real calculator without running Streamlit."""
-    source = (ROOT / "app.py").read_text()
+    source = (ROOT / "views" / "shortlist_builder.py").read_text()
     tree = ast.parse(source)
 
     functions = [
@@ -33,7 +33,7 @@ def load_calculator():
     }
 
     module = ast.Module(body=functions, type_ignores=[])
-    exec(compile(module, str(ROOT / "app.py"), "exec"), namespace)
+    exec(compile(module, str(ROOT / "views" / "shortlist_builder.py"), "exec"), namespace)
 
     return namespace["required_visits_per_variant"]
 
