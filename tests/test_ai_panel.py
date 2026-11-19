@@ -1,4 +1,5 @@
-"""The Plan review section renders inside the real app (no API key needed)."""
+"""The second-opinion section renders inside the real app (no API key needed),
+and its notes fit on the one-page PDF brief."""
 
 import unittest
 from pathlib import Path
@@ -29,9 +30,29 @@ class PlanReviewPanelTest(unittest.TestCase):
         }
         app = self.run_builder(shortlist)
         text = " ".join(str(m.value) for m in app.markdown)
-        self.assertIn("Plan review", text)
-        self.assertIn("Too much Campus Collection", text)
+        self.assertIn("Second opinion before you export", text)
+        rows = " ".join(e.label for e in app.expander)  # the checks list is one row per check
+        self.assertIn("Too much Campus Collection", rows)
+        self.assertIn("Ask Gemini for a second opinion", text)
         self.assertIn("Post-Christmas", text)
+
+
+class BriefNotesTest(unittest.TestCase):
+    """The AI notes are an optional extra on the brief: it must still be one page."""
+
+    def test_fifteen_products_with_notes_stay_on_one_page(self):
+        import re
+
+        from test_part_a_pdf import TestPDFExport, load_pdf_builder
+
+        build = load_pdf_builder()
+        shortlist, cats, prices = TestPDFExport.make_data(None, 15)
+        notes = ["Black Friday has no gift over $50 & <one> phase is empty."] + [
+            f"Issue {i}: a two-sentence explanation of the problem. It cites 12.5% and $18." for i in range(5)
+        ]
+        pdf = build(shortlist, cats, prices, 0, review_notes=notes)
+        self.assertTrue(pdf.startswith(b"%PDF-"))
+        self.assertEqual(len(re.findall(rb"/Type\s*/Page\b", pdf)), 1)
 
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ def set_plotly_theme():
                    linecolor="rgba(128,128,128,0.35)", automargin=True),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
         hoverlabel=dict(bgcolor="#1B2133", font_color="#FFFFFF", bordercolor="#1B2133"),
-        margin=dict(l=10, r=20, t=30, b=20),
+        margin=dict(l=14, r=20, t=34, b=30),
     )
     pio.templates["holiday_shelf"] = tpl
     pio.templates.default = "holiday_shelf"
@@ -136,7 +136,9 @@ div[data-testid="stVerticalBlock"][class*="stVerticalBlock"] > div[data-testid="
 [data-testid="stAlert"] {{ border-radius: 14px; }}
 [data-testid="stExpander"] {{ border-radius: 14px; border: 1px solid var(--hs-border); background: var(--hs-card); }}
 [data-testid="stPlotlyChart"] {{ background: var(--hs-card); border: 1px solid var(--hs-border);
-                                 border-radius: 16px; padding: 10px; box-shadow: var(--hs-shadow); }}
+                                 border-radius: 16px; padding: 0; box-shadow: var(--hs-shadow); overflow: hidden; }}
+/* No padding: Streamlit fixes the chart box at the figure's height, so padding pushed the
+   x-axis title out of view. The chart template's margins give the spacing instead. */
 
 [data-testid="stPlotlyChart"] div, .js-plotly-plot, .plot-container, .svg-container {{ background: transparent !important; }}
 
@@ -220,7 +222,15 @@ def insight_card(kind: str, label: str, value: str, text: str):
             f'<div class="v">{value}</div><div class="d">{text}</div></div>')
 
 
+# The chart card has no padding (see CSS), so a chart that sets its own margins gets at
+# least this much room, or its labels would touch the card edge.
+MIN_MARGIN = {"l": 12, "r": 16, "t": 14, "b": 14}
+
+
 def plot(fig, **kwargs):
     """st.plotly_chart that keeps our theme (Streamlit's own chart theme would override it)."""
+    m = fig.layout.margin
+    fig.update_layout(margin={side: max(getattr(m, side), low) for side, low in MIN_MARGIN.items()
+                              if getattr(m, side) is not None})
     kwargs.setdefault("width", "stretch")
     return st.plotly_chart(fig, theme=None, **kwargs)
