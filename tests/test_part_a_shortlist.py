@@ -56,71 +56,63 @@ class TestShortlistBuilder(unittest.TestCase):
         messages = " ".join(str(x.value) for x in app.info)
         self.assertIn("shortlist is empty", messages.lower())
 
+    # The Builder edits phase / slot / replacement in one table (st.data_editor),
+    # which AppTest can't type into, so the edits go through the same function
+    # the page calls (shortlist_plan.apply_table_edits) and the page is checked
+    # to show the result.
+
+    def table_for(self, shortlist):
+        from shortlist_plan import plan_table
+        summary = self.products
+        prices = pd.DataFrame({"item_name": [], "typical_price": []})
+        return plan_table(shortlist, summary, prices, {}, lambda rate: None)
+
+    def edit(self, field, value):
+        from shortlist_plan import apply_table_edits, normalize_shortlist
+        shortlist = normalize_shortlist({self.product_name: self.product.copy()})
+        table = self.table_for(shortlist)
+        table.loc[0, field] = value
+        new, changed = apply_table_edits(shortlist, table)
+        self.assertTrue(changed)
+        return new[self.product_name]
+
     def test_02_populated_shortlist(self):
         app = self.app_with_product()
         self.assertEqual(len(app.session_state["shortlist"]), 1)
 
         metrics = {m.label: str(m.value) for m in app.metric}
-        self.assertEqual(metrics["Products selected"], "1")
-        self.assertEqual(metrics["Products with price data"], "1")
+        self.assertEqual(metrics["Products"], "1")
+        self.assertEqual(metrics["Phases covered"], "1 / 4")
 
     def test_03_change_holiday_phase(self):
-        app = self.app_with_product()
-        self.widget(
-            app.selectbox, "Holiday phase"
-        ).set_value("Mid-Dec").run()
+        item = self.edit("Phase", "Mid-Dec")
+        self.assertEqual(item["holiday_phase"], "Mid-Dec")
 
-        self.check_app(app)
+        app = self.new_app()
+        app.session_state["shortlist"] = {self.product_name: item}
+        self.go_to(app, "Shortlist Builder")
         self.assertEqual(
-            app.session_state["shortlist"][
-                self.product_name
-            ]["holiday_phase"],
+            app.session_state["shortlist"][self.product_name]["holiday_phase"],
             "Mid-Dec",
         )
 
     def test_04_change_placement(self):
-        app = self.app_with_product()
-        self.widget(
-            app.selectbox, "Placement slot"
-        ).set_value("Category page").run()
-
-        self.check_app(app)
-        self.assertEqual(
-            app.session_state["shortlist"][
-                self.product_name
-            ]["placement_slot"],
-            "Category page",
-        )
+        item = self.edit("Slot", "Category page")
+        self.assertEqual(item["placement_slot"], "Category page")
 
     def test_05_cart_addon_placement(self):
-        app = self.app_with_product()
-        self.widget(
-            app.selectbox, "Placement slot"
-        ).set_value("Cart add-on").run()
-
-        self.check_app(app)
-
-        item = app.session_state["shortlist"][
-            self.product_name
-        ]
+        item = self.edit("Slot", "Cart add-on")
         self.assertEqual(item["placement_slot"], "Cart add-on")
         self.assertIsNone(item["replacement_product"])
 
     def test_06_replacement_dropdown(self):
-        app = self.app_with_product()
-        replacement = self.widget(
-            app.selectbox, "Product to replace"
+        from shortlist_plan import replacement_options
+        options = replacement_options(
+            {self.product_name: self.product.copy()}, self.products
         )
-
-        self.assertIn(
-            "No replacement",
-            replacement.options,
-        )
+        self.assertIn("No replacement", options)
         self.assertFalse(
-            any(
-                str(option).lower() == "nan"
-                for option in replacement.options
-            )
+            any(str(option).lower() == "nan" for option in options)
         )
 
     def test_07_add_from_scorecard(self):

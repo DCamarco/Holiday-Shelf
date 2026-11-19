@@ -39,29 +39,21 @@ class TestShortlistSize(unittest.TestCase):
 
         return app
 
+    def size_tile(self, app):
+        tile = next(m for m in app.metric if m.label == "Products")
+        return str(tile.value), str(tile.delta)
+
     def test_below_recommended_range(self):
         app = self.open_with_products(5)
-        messages = " ".join(
-            str(x.value) for x in app.info
-        )
-        self.assertIn("Add at least 5 more", messages)
+        self.assertEqual(self.size_tile(app), ("5", "Add 5 more"))
 
     def test_within_recommended_range(self):
         app = self.open_with_products(12)
-        messages = " ".join(
-            str(x.value) for x in app.success
-        )
-        self.assertIn(
-            "12-product shortlist is within",
-            messages,
-        )
+        self.assertEqual(self.size_tile(app), ("12", "In range"))
 
     def test_above_recommended_range(self):
         app = self.open_with_products(16)
-        messages = " ".join(
-            str(x.value) for x in app.warning
-        )
-        self.assertIn("removing 1", messages)
+        self.assertEqual(self.size_tile(app), ("16", "1 over"))
 
 
 if __name__ == "__main__":

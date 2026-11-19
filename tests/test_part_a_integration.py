@@ -109,13 +109,9 @@ class TestPartAIntegration(unittest.TestCase):
 
         self.check_app(app)
 
-        phase_selector = next(
-            s for s in app.selectbox
-            if s.label == "Holiday phase"
-        )
-
+        # Opening the Builder must keep the phase chosen on the Season Playbook.
         self.assertEqual(
-            phase_selector.value,
+            app.session_state["shortlist"][JOURNAL]["holiday_phase"],
             "Mid-Dec",
         )
 

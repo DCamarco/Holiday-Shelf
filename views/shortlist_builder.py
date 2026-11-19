@@ -1,17 +1,22 @@
-"""Shortlist Builder: assign phase, slot and replacement, then export the shelf plan."""
+"""Shortlist Builder: plan board, one editable table with bulk actions, AI review, export.
 
+The plan logic lives in shortlist_plan.py; this file only draws the page."""
+
+import math
 from io import BytesIO
 from statistics import NormalDist
 from xml.sax.saxutils import escape
-import math
+
 import pandas as pd
 import streamlit as st
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import landscape, letter
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
 import ai_panel
+from ai_context import PHASES, SLOTS, recommended_phases
 from shared import (
     load_pairs,
     load_product_prices,
@@ -19,6 +24,20 @@ from shared import (
     load_rescue,
     load_weekly,
 )
+from shortlist_plan import (
+    apply_table_edits,
+    bad_replacements,
+    board_html,
+    fill_empty_phases,
+    normalize_shortlist,
+    plan_stats,
+    plan_table,
+    remove_keys,
+    replacement_options,
+    set_for,
+    use_playbook_phases,
+)
+from ui import LABEL_COLORS
 
 
 def required_visits_per_variant(
@@ -63,8 +82,10 @@ def required_visits_per_variant(
 
 
 
-def build_shelf_brief_pdf(shortlist_df, category_mix, price_mix, weak_count):
-    """Generate a one-page landscape merchandising brief."""
+def build_shelf_brief_pdf(shortlist_df, category_mix, price_mix, weak_count, review_notes=None):
+    """Generate a one-page landscape merchandising brief.
+
+    review_notes: optional lines from the AI second opinion (already number-checked)."""
     from reportlab.platypus import KeepInFrame
 
     buffer = BytesIO()
@@ -164,566 +185,461 @@ def build_shelf_brief_pdf(shortlist_df, category_mix, price_mix, weak_count):
                   "80% power, 20% relative conversion lift; visits shown per variant. "
                   "Based on the 2020–2021 holiday season; estimates, not guarantees.", note_style),
     ]
+    if review_notes:
+        story += [
+            Spacer(1, 6),
+            Paragraph("<b>Second opinion (written by Gemini; every number checked against the "
+                      "data):</b>", note_style),
+            *[Paragraph("• " + escape(line), note_style) for line in review_notes],
+        ]
     doc.build([KeepInFrame(720, 536, story, mode="shrink")])
     pdf_data = buffer.getvalue()
     buffer.close()
     return pdf_data
 
 
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
+
+
+def _visits_per_day(rate):
+    """Daily visits per variant for the two-week test, or None without a rate."""
+    visits = required_visits_per_variant(rate)
+    return None if visits is None else math.ceil(visits / 14)
+
+
+@st.cache_data
+def _recommended_phases():
+    return recommended_phases(load_weekly())
+
+
+def _commit(new_shortlist: dict, message: str) -> None:
+    """Save a bulk change, reset the table's edit state, and redraw."""
+    st.session_state.shortlist = new_shortlist
+    st.session_state["plan_msg"] = message
+    st.session_state["plan_editor_v"] = st.session_state.get("plan_editor_v", 0) + 1
+    st.rerun()
+
+
+def _size_status(n: int) -> tuple[str, str]:
+    if n < 10:
+        return f"Add {10 - n} more", "inverse"
+    if n > 15:
+        return f"{n - 15} over", "inverse"
+    return "In range", "normal"
+
+
+def _render_tiles(stats: dict) -> None:
+    n = stats["count"]
+    note, color = _size_status(n)
+    t1, t2, t3, t4, t5 = st.columns(5)
+    t1.metric("Products", n, delta=note, delta_color=color, delta_arrow="off",
+              help="The brief asks for 10–15 featured products.")
+    covered = stats["phases_covered"]
+    t2.metric("Phases covered", f"{covered} / 4",
+              delta="All covered" if covered == 4 else f"{4 - covered} empty",
+              delta_color="normal" if covered == 4 else "inverse", delta_arrow="off")
+    share = stats["top_category_share"]
+    t3.metric("Top category", f"{share}%", delta=stats["top_category"],
+              delta_color="inverse" if share > 40 else "off", delta_arrow="off",
+              help="Above 40% of the plan in one category is flagged as overload.")
+    weak = stats["weak"]
+    t4.metric("Weak data", weak, delta="OK" if not weak else "Check these",
+              delta_color="normal" if not weak else "inverse", delta_arrow="off",
+              help="Too few views, unmatched purchases, or a very wide 95% range.")
+    off = stats["off_playbook"]
+    t5.metric("Off-Playbook", off, delta="Aligned" if not off else "Different phase",
+              delta_color="normal" if not off else "off", delta_arrow="off",
+              help="Picks scheduled in a phase other than their best phase on the Season Playbook.")
+
+
+def _render_empty_state(summary_df, recommended) -> None:
+    st.info("Your shortlist is empty. Add products from the Shelf Scorecard or "
+            "Opportunity Finder, or start from a ready-made plan.")
+    with st.container(border=True):
+        st.markdown("**Quick start**")
+        st.caption("Adds the strongest Stars (then Hidden Gems) for each holiday phase, using each product's best "
+                   "phase from the Season Playbook. Strongest means the highest low end of the 95% "
+                   "range, so products with little data can't win on luck. You can edit everything after.")
+        per_phase = st.segmented_control("Products per phase", [2, 3, 4], default=3,
+                                         key="quick_start_n")
+        if st.button("✨ Build a starter plan", type="primary"):
+            new, added = fill_empty_phases({}, summary_df, recommended, per_phase=per_phase or 3)
+            _commit(new, f"Added {len(added)} products across the four phases. Edit them below.")
+
+
+def _render_editor(shortlist, table, summary_df, recommended, stats) -> None:
+    st.markdown("### Edit the plan")
+    st.caption("Change phase, slot or what each pick replaces right in the table. "
+               "Tick rows to move or remove several at once.")
+
+    a1, a2, _ = st.columns([1.3, 1.3, 2])
+    if a1.button("✨ Use Playbook timing for all", disabled=stats["off_playbook"] == 0,
+                 help="Move every pick to its best phase on the Season Playbook.",
+                 width="stretch"):
+        new, moved = use_playbook_phases(shortlist, recommended)
+        _commit(new, f"Moved {moved} product{'s' if moved != 1 else ''} to their Season Playbook phase.")
+    if a2.button("➕ Fill the plan", disabled=stats["phases_covered"] == 4 and len(shortlist) >= 10,
+                 help="Add the two strongest unused Stars (or Hidden Gems) to each empty phase, "
+                      "then top the plan up to 10 picks, always into the thinnest phase.",
+                 width="stretch"):
+        new, added = fill_empty_phases(shortlist, summary_df, recommended, per_phase=2, min_total=10)
+        if added:
+            _commit(new, "Added " + ", ".join(added) + ".")
+        st.info("No unused Stars or Hidden Gems have an empty phase as their best phase.")
+
+    toolbar = st.container()
+    version = st.session_state.get("plan_editor_v", 0)
+    edited = st.data_editor(
+        table,
+        key=f"plan_editor_{version}",
+        hide_index=True,
+        width="stretch",
+        height=35 * (len(table) + 1) + 3,  # every row visible, no scrolling inside the table
+        column_order=[c for c in table.columns if c != "key"],
+        disabled=["Product", "Label", "Category", "Price", "Conversion", "Weak data",
+                  "Playbook phase", "Test visits/day"],
+        column_config={
+            "Select": st.column_config.CheckboxColumn("✓", width="small"),
+            "Product": st.column_config.TextColumn(width="medium", pinned=True),
+            "Label": st.column_config.TextColumn(width="small"),
+            "Category": st.column_config.TextColumn(width="small"),
+            "Price": st.column_config.NumberColumn(format="$%.2f", width="small",
+                                                   help="Median transaction price."),
+            "Conversion": st.column_config.NumberColumn(
+                "View → buy", format="percent", width="small",
+                help="Share of sessions that viewed the product and bought it."),
+            "Weak data": st.column_config.CheckboxColumn(width="small"),
+            "Playbook phase": st.column_config.TextColumn(
+                width="medium", help="Best phase on the Season Playbook (most purchases per week)."),
+            "Phase": st.column_config.SelectboxColumn(options=PHASES, required=True, width="medium"),
+            "Slot": st.column_config.SelectboxColumn(options=SLOTS, required=True, width="medium"),
+            "Replaces": st.column_config.SelectboxColumn(
+                options=replacement_options(shortlist, summary_df) + ["— (add-on)"],
+                width="medium",
+                help="A weaker product in the same category that this pick takes the place of. "
+                     "Cart add-ons don't replace anything."),
+            "Test visits/day": st.column_config.NumberColumn(
+                width="small", help="Visits per variant per day for a two-week A/B test."),
+        },
+    )
+
+    new, changed = apply_table_edits(shortlist, edited)
+    if changed:
+        st.session_state.shortlist = new
+        st.rerun()
+
+    selected = edited.loc[edited["Select"].astype(bool), "key"].tolist()
+    if selected:
+        with toolbar.container(border=True):
+            st.markdown(f"**{len(selected)} selected**")
+            c1, c2, c3, c4 = st.columns([2, 2, 1, 1], vertical_alignment="bottom")
+            phase = c1.selectbox("Move to phase", PHASES, index=None,
+                                 placeholder="Keep phase", key=f"bulk_phase_{version}")
+            slot = c2.selectbox("Set slot", SLOTS, index=None,
+                                placeholder="Keep slot", key=f"bulk_slot_{version}")
+            if c3.button("Apply", type="primary", disabled=not (phase or slot), width="stretch"):
+                _commit(set_for(shortlist, selected, phase=phase, slot=slot),
+                        f"Updated {len(selected)} product{'s' if len(selected) != 1 else ''}.")
+            if c4.button("🗑 Remove", width="stretch"):
+                _commit(remove_keys(shortlist, selected),
+                        f"Removed {len(selected)} product{'s' if len(selected) != 1 else ''}.")
+
+    bad = bad_replacements(shortlist, summary_df)
+    if bad:
+        st.warning("These replacements aren't weaker products in the same category: "
+                   + "; ".join(f"**{p}** → {r}" for p, r in bad))
+
+    with st.expander("How the test traffic is sized"):
+        st.markdown(
+            "Each pick gets a two-week A/B test: the current shelf against the new one. "
+            "**Test visits/day** is the traffic each version needs per day to detect a 20% "
+            "relative lift in view-to-buy conversion (two-sided test, 95% confidence, 80% power). "
+            "Products that already convert at low rates need far more traffic. "
+            "Blank means the product has no usable conversion rate (for example, cart add-ons)."
+        )
+
+
 def render():
     st.title("Shortlist Builder")
 
-    # Recommended merchandising shortlist size: 10–15 products.
-    selected_count = len(st.session_state.shortlist)
+    summary_df = load_product_summary()
+    price_df = load_product_prices()
+    recommended = _recommended_phases()
 
-    if 0 < selected_count < 10:
-        st.info(
-            f"You have selected {selected_count} products. "
-            f"Add at least {10 - selected_count} more to reach "
-            "the recommended 10–15 product range."
-        )
-    elif 10 <= selected_count <= 15:
-        st.success(
-            f"Your {selected_count}-product shortlist is within "
-            "the recommended 10–15 product range."
-        )
-    elif selected_count > 15:
-        st.warning(
-            f"You have selected {selected_count} products. "
-            f"Consider removing {selected_count - 15} to stay "
-            "within the recommended 10–15 product range."
-        )
+    if msg := st.session_state.pop("plan_msg", None):
+        st.success(msg)
 
+    if not st.session_state.shortlist:
+        _render_empty_state(summary_df, recommended)
+        return
 
+    # Give every pick a valid phase/slot (new picks start in their Playbook phase).
+    st.session_state.shortlist = normalize_shortlist(st.session_state.shortlist, recommended)
+    shortlist = st.session_state.shortlist
 
-    if st.session_state.shortlist:
+    table = plan_table(shortlist, summary_df, price_df, recommended, _visits_per_day)
+    stats = plan_stats(shortlist, table)
 
-        phase_options = [
-            "Early Nov",
-            "Black Friday / Cyber Monday",
-            "Mid-Dec",
-            "Post-Christmas",
-        ]
+    _render_tiles(stats)
 
-        slot_options = [
-            "Homepage",
-            "Category page",
-            "Promo banner",
-            "Cart add-on",
-        ]
-        summary_df = load_product_summary()
+    st.markdown("### Plan by holiday phase")
+    st.html(board_html(table, LABEL_COLORS))
 
-        st.markdown("### Assign holiday phases and placements")
+    _render_editor(shortlist, table, summary_df, recommended, stats)
 
-        # Add planning controls for every shortlisted product.
-        for shortlist_key, product in list(
-            st.session_state.shortlist.items()
-        ):
+    # Person C: AI plan review (rule checks + Gemini). See AI_PLAN.md.
+    st.divider()
+    ai_panel.render_plan_review(
+        st.session_state.shortlist, summary_df, load_weekly(),
+        load_pairs(), load_rescue(), price_df,
+    )
 
-            # Set default values without overwriting previous selections.
-            phase_aliases = {
-                "Black Friday": "Black Friday / Cyber Monday",
-                "Mid-December": "Mid-Dec",
-            }
+    # ---------------- Export table (unchanged columns) ----------------
+    # Refresh the table using the updated product information.
+    shortlist_df = pd.DataFrame(
+        list(st.session_state.shortlist.values())
+    )
 
-            saved_phase = product.get("holiday_phase")
-            product["holiday_phase"] = phase_aliases.get(
-                saved_phase, saved_phase
-            )
+    price_df = load_product_prices()
 
-            if product["holiday_phase"] not in phase_options:
-                product["holiday_phase"] = "Black Friday / Cyber Monday"
+    shortlist_df = shortlist_df.merge(
+        price_df,
+        on="item_name",
+        how="left",
+    )
 
-            if product.get("placement_slot") not in slot_options:
-                old_slot = str(product.get("slot") or "").strip().lower()
-
-                slot_aliases = {
-                    "homepage": "Homepage",
-                    "category page": "Category page",
-                    "banner": "Promo banner",
-                    "promo banner": "Promo banner",
-                    "cart add-on": "Cart add-on",
-                }
-
-                product["placement_slot"] = slot_aliases.get(
-                    old_slot, "Homepage"
-                )
-
-            with st.container(border=True):
-
-                product_name = product.get(
-                    "item_name", shortlist_key
-                )
-
-                st.markdown(f"**{product_name}**")
-
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    phase = st.selectbox(
-                        "Holiday phase",
-                        options=phase_options,
-                        index=phase_options.index(
-                            product["holiday_phase"]
-                        ),
-                        key=f"phase_{shortlist_key}",
-                    )
-
-                with col2:
-                    slot = st.selectbox(
-                        "Placement slot",
-                        options=slot_options,
-                        index=slot_options.index(
-                            product["placement_slot"]
-                        ),
-                        key=f"slot_{shortlist_key}",
-                    )
-
-                # Save the selected planning information.
-                product["holiday_phase"] = phase
-                product["placement_slot"] = slot
-                product["slot"] = slot
-
-
-                # Select a weaker product to replace.
-                if slot == "Cart add-on":
-                    product["replacement_product"] = None
-                    st.caption(
-                        "Cart add-ons complement an anchor product "
-                        "and do not replace a homepage or category slot."
-                    )
-
-                else:
-                    category = product.get("item_category")
-
-                    candidates = summary_df[
-                        (summary_df["item_category"] == category)
-                        & summary_df["label"].isin(
-                            ["Window-Shopper", "Low Priority"]
-                        )
-                        & (summary_df["item_name"] != product_name)
-                    ].copy()
-
-                    candidates = candidates.sort_values(
-                        "view_to_buy_rate",
-                        ascending=True,
-                        na_position="last",
-                    )
-
-                    candidate_names = (
-                        candidates["item_name"].dropna().tolist()
-                    )
-
-                    replacement_options = [
-                        "No replacement"
-                    ] + candidate_names
-
-
-
-
-                    suggested = product.get("replaces")
-
-                    if suggested is not None and pd.isna(suggested):
-                        suggested = None
-
-                    saved_replacement = product.get("replacement_product")
-
-                    if saved_replacement is not None and pd.isna(saved_replacement):
-                        saved_replacement = None
-
-                    current = saved_replacement or suggested or "No replacement"
-
-                    if current not in replacement_options:
-                        current = "No replacement"
-
-                    replacement = st.selectbox(
-                        "Product to replace",
-                        options=replacement_options,
-                        index=replacement_options.index(current),
-                        key=f"replacement_{shortlist_key}",
-                    )
-
-                    product["replacement_product"] = (
-                        None
-                        if replacement == "No replacement"
-                        else replacement
-                    )
-
-                    if suggested:
-                        st.caption(
-                            f"Opportunity Finder suggestion: {suggested}"
-                        )
-
-                    if not candidate_names:
-                        st.info(
-                            "No eligible weaker products were found "
-                            "in this category."
-                        )
-
-                # Two-week A/B testing recommendation
-                st.markdown("**Two-week test plan**")
-
-                baseline_rate = product.get("view_to_buy_rate")
-
-                required_per_variant = required_visits_per_variant(
-                    baseline_rate
-                )
-
-                if required_per_variant is None:
-                    st.info(
-                        "Testing traffic estimate unavailable because "
-                        "this product does not have a valid historical "
-                        "conversion rate."
-                    )
-
-                else:
-                    total_visits = required_per_variant * 2
-                    daily_target = math.ceil(
-                        required_per_variant / 14
-                    )
-
-                    target_rate = min(
-                        float(baseline_rate) * 1.20,
-                        0.999999
-                    )
-
-                    st.write(
-                        f"Historical conversion: "
-                        f"{float(baseline_rate):.1%}"
-                    )
-
-                    st.write(
-                        f"Target conversion: {target_rate:.1%} "
-                        f"(20% relative improvement)"
-                    )
-
-                    st.write(
-                        f"Required traffic: "
-                        f"{required_per_variant:,} visits per variant "
-                        f"({total_visits:,} combined)"
-                    )
-
-                    st.write(
-                        f"Daily target: approximately "
-                        f"{daily_target:,} visits per variant "
-                        f"for 14 days."
-                    )
-
-                st.caption(
-                    "Estimate assumes a two-sided test, 95% confidence "
-                    "and 80% statistical power. Actual results may differ."
-                )
-
-
-
-        # Refresh the table using the updated product information.
-        shortlist_df = pd.DataFrame(
-            list(st.session_state.shortlist.values())
-        )
-
-        price_df = load_product_prices()
-
-        shortlist_df = shortlist_df.merge(
-            price_df,
-            on="item_name",
-            how="left",
-        )
-
-        # Add testing estimates to the exportable plan.
-        if "view_to_buy_rate" in shortlist_df.columns:
-            baseline_rates = pd.to_numeric(
-                shortlist_df["view_to_buy_rate"],
-                errors="coerce",
-            )
-        else:
-            baseline_rates = pd.Series(
-                float("nan"),
-                index=shortlist_df.index,
-            )
-
-        shortlist_df["test_baseline_rate"] = baseline_rates
-
-        shortlist_df["test_visits_per_variant"] = (
-            baseline_rates.apply(required_visits_per_variant)
-        )
-
-        visits_numeric = pd.to_numeric(
-            shortlist_df["test_visits_per_variant"],
+    # Add testing estimates to the exportable plan.
+    if "view_to_buy_rate" in shortlist_df.columns:
+        baseline_rates = pd.to_numeric(
+            shortlist_df["view_to_buy_rate"],
             errors="coerce",
         )
-
-        shortlist_df["test_target_rate"] = (
-            baseline_rates * 1.20
-        ).clip(upper=0.999999).where(visits_numeric.notna())
-
-        shortlist_df["test_total_visits"] = visits_numeric * 2
-
-        shortlist_df["test_daily_visits_per_variant"] = (
-            visits_numeric.apply(
-                lambda value: math.ceil(value / 14)
-                if pd.notna(value) else None
-            )
+    else:
+        baseline_rates = pd.Series(
+            float("nan"),
+            index=shortlist_df.index,
         )
 
+    shortlist_df["test_baseline_rate"] = baseline_rates
 
-        priced_count = int(
-            shortlist_df["typical_price"].notna().sum()
+    shortlist_df["test_visits_per_variant"] = (
+        baseline_rates.apply(required_visits_per_variant)
+    )
+
+    visits_numeric = pd.to_numeric(
+        shortlist_df["test_visits_per_variant"],
+        errors="coerce",
+    )
+
+    shortlist_df["test_target_rate"] = (
+        baseline_rates * 1.20
+    ).clip(upper=0.999999).where(visits_numeric.notna())
+
+    shortlist_df["test_total_visits"] = visits_numeric * 2
+
+    shortlist_df["test_daily_visits_per_variant"] = (
+        visits_numeric.apply(
+            lambda value: math.ceil(value / 14)
+            if pd.notna(value) else None
+        )
+    )
+
+
+    priced_count = int(
+        shortlist_df["typical_price"].notna().sum()
+    )
+
+    unknown_count = len(shortlist_df) - priced_count
+
+    # ---------------- Plan mix calculations ----------------
+
+    total_products = len(shortlist_df)
+
+    # Category distribution
+    category_mix = (
+        shortlist_df["item_category"]
+        .fillna("Unknown category")
+        .value_counts()
+        .rename_axis("Category")
+        .reset_index(name="Products")
+    )
+
+    category_mix["Share (%)"] = (
+        category_mix["Products"] / total_products * 100
+    ).round(1)
+
+    # Price distribution using typical historical transaction prices
+    numeric_prices = pd.to_numeric(
+        shortlist_df["typical_price"],
+        errors="coerce"
+    )
+
+    price_bands = pd.cut(
+        numeric_prices,
+        bins=[
+            float("-inf"),
+            10,
+            25,
+            50,
+            float("inf")
+        ],
+        labels=[
+            "Under $10",
+            "$10–$24.99",
+            "$25–$49.99",
+            "$50+"
+        ],
+        right=False
+    )
+
+    price_mix = (
+        price_bands.astype("object")
+        .fillna("Unknown")
+        .value_counts()
+        .rename_axis("Price band")
+        .reset_index(name="Products")
+    )
+
+    price_mix["Share (%)"] = (
+        price_mix["Products"] / total_products * 100
+    ).round(1)
+
+    # Weak-data count for the brief: the same number as the page's Weak data tile
+    # (each pick looked up in the product summary, so cart add-ons count correctly).
+    weak_count = stats["weak"]
+
+
+
+    st.markdown("### Category and price mix")
+
+    mix_col1, mix_col2 = st.columns(2)
+
+    with mix_col1:
+        st.markdown("**Category distribution**")
+        st.bar_chart(
+            category_mix.set_index("Category")["Products"]
+        )
+        st.dataframe(
+            category_mix,
+            width="stretch",
+            hide_index=True
         )
 
-        unknown_count = len(shortlist_df) - priced_count
-
-        # ---------------- Plan mix calculations ----------------
-
-        total_products = len(shortlist_df)
-
-        # Category distribution
-        category_mix = (
-            shortlist_df["item_category"]
-            .fillna("Unknown category")
-            .value_counts()
-            .rename_axis("Category")
-            .reset_index(name="Products")
+    with mix_col2:
+        st.markdown("**Price distribution**")
+        st.bar_chart(
+            price_mix.set_index("Price band")["Products"]
+        )
+        st.dataframe(
+            price_mix,
+            width="stretch",
+            hide_index=True
         )
 
-        category_mix["Share (%)"] = (
-            category_mix["Products"] / total_products * 100
-        ).round(1)
-
-        # Price distribution using typical historical transaction prices
-        numeric_prices = pd.to_numeric(
-            shortlist_df["typical_price"],
-            errors="coerce"
-        )
-
-        price_bands = pd.cut(
-            numeric_prices,
-            bins=[
-                float("-inf"),
-                10,
-                25,
-                50,
-                float("inf")
-            ],
-            labels=[
-                "Under $10",
-                "$10–$24.99",
-                "$25–$49.99",
-                "$50+"
-            ],
-            right=False
-        )
-
-        price_mix = (
-            price_bands.astype("object")
-            .fillna("Unknown")
-            .value_counts()
-            .rename_axis("Price band")
-            .reset_index(name="Products")
-        )
-
-        price_mix["Share (%)"] = (
-            price_mix["Products"] / total_products * 100
-        ).round(1)
-
-        # Identify picks with weak or incomplete performance data
-        weak_data = pd.Series(
-            False,
-            index=shortlist_df.index
-        )
-
-        for flag in [
-            "views_likely_insufficient",
-            "purchases_unmatched"
-        ]:
-            if flag in shortlist_df.columns:
-                weak_data |= (
-                    shortlist_df[flag]
-                    .fillna(True)
-                    .astype(bool)
-                )
-            else:
-                weak_data |= True
-
-        for metric in [
-            "sessions_viewed",
-            "view_to_buy_ci_low"
-        ]:
-            if metric in shortlist_df.columns:
-                weak_data |= pd.to_numeric(
-                    shortlist_df[metric],
-                    errors="coerce"
-                ).isna()
-            else:
-                weak_data |= True
-
-        if "label" in shortlist_df.columns:
-            weak_data |= shortlist_df["label"].eq(
-                "Not Enough Data"
-            ).fillna(False)
-
-        weak_count = int(weak_data.sum())
+    st.caption(
+        "Price bands use median historical transaction prices. "
+        "Unknown prices are shown separately."
+    )
 
 
-        st.divider()
-        st.markdown("### Plan overview")
+    st.markdown("### Export")
 
-        c1, c2, c3 = st.columns(3)
+    display_columns = [
+        "item_name",
+        "item_category",
+        "typical_price",
+        "min_price",
+        "max_price",
+        "holiday_phase",
+        "placement_slot",
+        "paired_with",
+        "replaces",
+        "sessions_viewed",
+        "sessions_purchased",
+        "view_to_buy_rate",
+        "view_to_buy_ci_low",
+        "revenue",
+        "label",
+        "replacement_product",
+        "test_visits_per_variant",
+        "test_total_visits",
+        "test_daily_visits_per_variant",
+    ]
 
-        c1.metric("Products selected", total_products)
-
-        c2.metric("Products with price data", priced_count)
-
-        c3.metric(
-            "Picks with weak data",
-            f"{weak_count}/{total_products}"
-        )
-
-        st.markdown("### Category and price mix")
-
-        mix_col1, mix_col2 = st.columns(2)
-
-        with mix_col1:
-            st.markdown("**Category distribution**")
-            st.bar_chart(
-                category_mix.set_index("Category")["Products"]
-            )
-            st.dataframe(
-                category_mix,
-                width="stretch",
-                hide_index=True
-            )
-
-        with mix_col2:
-            st.markdown("**Price distribution**")
-            st.bar_chart(
-                price_mix.set_index("Price band")["Products"]
-            )
-            st.dataframe(
-                price_mix,
-                width="stretch",
-                hide_index=True
-            )
-
-        st.caption(
-            "Price bands use median historical transaction prices. "
-            "Unknown prices are shown separately."
-        )
-
-        if weak_count:
-            st.warning(
-                f"{weak_count} of {total_products} picks rely on "
-                "weak or incomplete performance data. "
-                "Cart add-ons without product-level view metrics "
-                "are also included."
-            )
-        else:
-            st.success(
-                "All selected products have sufficient performance data."
-            )
-
-        # Person C: AI plan review (rule checks + Gemini). See AI_PLAN.md.
-        ai_panel.render_plan_review(
-            st.session_state.shortlist, summary_df, load_weekly(),
-            load_pairs(), load_rescue(), price_df,
-        )
-
-        st.markdown("### Your selected products")
-
-        display_columns = [
-            "item_name",
-            "item_category",
-            "typical_price",
-            "min_price",
-            "max_price",
-            "holiday_phase",
-            "placement_slot",
-            "paired_with",
-            "replaces",
-            "sessions_viewed",
-            "sessions_purchased",
-            "view_to_buy_rate",
-            "view_to_buy_ci_low",
-            "revenue",
-            "label",
-            "replacement_product",
-            "test_visits_per_variant",
-            "test_total_visits",
-            "test_daily_visits_per_variant",
-        ]
-
+    with st.expander("Full plan table (same columns as the CSV)"):
         st.dataframe(
             shortlist_df.reindex(columns=display_columns),
             width="stretch",
             hide_index=True,
         )
 
-        # Export the complete merchandising plan.
-        export_columns = [
-            "item_name",
-            "item_category",
-            "typical_price",
-            "min_price",
-            "max_price",
-            "holiday_phase",
-            "placement_slot",
-            "paired_with",
-            "replacement_product",
-            "replaces",
-            "sessions_viewed",
-            "sessions_purchased",
-            "view_to_buy_rate",
-            "view_to_buy_ci_low",
-            "view_to_buy_ci_high",
-            "revenue",
-            "label",
-            "test_baseline_rate",
-            "test_target_rate",
-            "test_visits_per_variant",
-            "test_total_visits",
-            "test_daily_visits_per_variant",
-        ]
+    # Export the complete merchandising plan.
+    export_columns = [
+        "item_name",
+        "item_category",
+        "typical_price",
+        "min_price",
+        "max_price",
+        "holiday_phase",
+        "placement_slot",
+        "paired_with",
+        "replacement_product",
+        "replaces",
+        "sessions_viewed",
+        "sessions_purchased",
+        "view_to_buy_rate",
+        "view_to_buy_ci_low",
+        "view_to_buy_ci_high",
+        "revenue",
+        "label",
+        "test_baseline_rate",
+        "test_target_rate",
+        "test_visits_per_variant",
+        "test_total_visits",
+        "test_daily_visits_per_variant",
+    ]
 
-        csv_data = (
-            shortlist_df.reindex(columns=export_columns)
-            .to_csv(index=False)
-            .encode("utf-8-sig")
-        )
+    csv_data = (
+        shortlist_df.reindex(columns=export_columns)
+        .to_csv(index=False)
+        .encode("utf-8-sig")
+    )
 
-        st.download_button(
-            "Download shelf plan (CSV)",
-            data=csv_data,
-            file_name="holiday_shelf_plan.csv",
-            mime="text/csv",
-        )
+    st.download_button(
+        "Download shelf plan (CSV)",
+        data=csv_data,
+        file_name="holiday_shelf_plan.csv",
+        mime="text/csv",
+    )
 
-        pdf_data = build_shelf_brief_pdf(
-            shortlist_df,
-            category_mix,
-            price_mix,
-            weak_count,
-        )
+    notes = ai_panel.brief_notes()
+    pdf_data = build_shelf_brief_pdf(
+        shortlist_df,
+        category_mix,
+        price_mix,
+        weak_count,
+        review_notes=notes,
+    )
 
-        st.download_button(
-            "Download one-page brief (PDF)",
-            data=pdf_data,
-            file_name="holiday_shelf_brief.pdf",
-            mime="application/pdf",
-        )
+    st.download_button(
+        "Download one-page brief (PDF)",
+        data=pdf_data,
+        file_name="holiday_shelf_brief.pdf",
+        mime="application/pdf",
+    )
+    st.caption("The brief includes the AI second opinion for this plan." if notes else
+               "Run the second opinion above to add its notes to the brief.")
 
 
-        st.caption(
-            "Typical price is the median recorded transaction price. "
-            "Minimum and maximum show the observed historical price range."
-        )
+    st.caption(
+        "Typical price is the median recorded transaction price. "
+        "Minimum and maximum show the observed historical price range."
+    )
 
-        if unknown_count:
-            st.warning(
-                f"{unknown_count} selected product(s) have no matching "
-                "transaction-price data."
-            )
-
-    else:
-        st.info(
-            "Your shortlist is empty. Add products from the "
-            "Shelf Scorecard or Opportunity Finder."
+    if unknown_count:
+        st.warning(
+            f"{unknown_count} selected product(s) have no matching "
+            "transaction-price data."
         )
